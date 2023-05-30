@@ -6,12 +6,18 @@ use serde_json::{from_str, to_string};
 
 use crate::account::Account;
 use crate::constants::*;
-use crate::utils::{aes_decrypt, aes_encrypt, password_to_aes_key_scrypt, scrypt_kdf};
+use crate::crypto::{
+    aes_decrypt, aes_encrypt, create_signature_program_context, password_to_aes_key_scrypt,
+    scrypt_kdf,
+};
+use crate::crypto::{ed25519_sign, sha256_hash};
+use crate::signature::SignableData;
+use crate::tx::Transaction;
 
 #[derive(Debug, Clone)]
 pub struct WalletConfig {
-    pub seed_rcp_server: Vec<String>,
-    pub rpc_timeout: u32,
+    pub seed_rpc_server: Vec<String>,
+    pub rpc_timeout: u64,
     pub rcp_concurrency: u32,
     pub password: String,
     pub iv: [u8; IV_LEN],
@@ -29,7 +35,7 @@ impl Default for WalletConfig {
         rng.fill(&mut master_key);
 
         Self {
-            seed_rcp_server: DEFAULT_RPC_SERVER.iter().map(|s| s.to_string()).collect(),
+            seed_rpc_server: DEFAULT_RPC_SERVER.iter().map(|s| s.to_string()).collect(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             rcp_concurrency: DEFAULT_RPC_CONCURRENCY,
             password: String::from("123456"),
@@ -63,7 +69,7 @@ impl WalletData {
             iv: encode(config.iv),
             master_key: encode(master_key_cipher),
             seed_encrypted: encode(seed_cipher),
-            address: account.address().to_string(),
+            address: account.address(),
             scrypt: config.scrypt.clone(),
         })
     }
@@ -95,7 +101,7 @@ pub struct Wallet {
 
 impl Wallet {
     #[no_mangle]
-    pub extern "C" fn new(account: Account, config: WalletConfig) -> Result<Self, String> {
+    pub fn new(account: Account, config: WalletConfig) -> Result<Self, String> {
         let wallet_data = WalletData::new(&account, &config)?;
         Ok(Self {
             config,
@@ -126,6 +132,46 @@ impl Wallet {
             account,
             wallet_data,
         })
+    }
+
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
+    pub fn public_key(&self) -> &[u8; PUBLIC_KEY_LEN] {
+        self.account.public_key()
+    }
+
+    pub fn private_key(&self) -> &[u8; PRIVATE_KEY_LEN] {
+        self.account.private_key()
+    }
+
+    pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
+        ed25519_sign(
+            message,
+            [
+                self.account.private_key().as_slice(),
+                self.account.public_key().as_slice(),
+            ]
+            .concat()
+            .as_slice(),
+        )
+    }
+
+    pub fn config(&self) -> &WalletConfig {
+        &self.config
+    }
+
+    pub fn set_config(&mut self, config: WalletConfig) {
+        self.config = config
+    }
+
+    pub fn sign_transaction(&self, tx: &mut Transaction) {
+        let ct = create_signature_program_context(self.public_key());
+        let msg = sha256_hash(tx.serialize_unsigned().as_slice());
+        let signature = self.sign(msg.as_slice());
+        let programs = ct.new_program(signature);
+        tx.set_programs(vec![programs])
     }
 }
 

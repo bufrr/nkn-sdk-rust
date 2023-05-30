@@ -1,13 +1,15 @@
 use crate::constants::*;
-use crate::utils::*;
+use crate::crypto::*;
 use ed25519_dalek::*;
 use rand::rngs::OsRng;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[repr(C)]
 pub struct Account {
-    private_key: [u8; PRIVATE_KEY_LEN],
-    public_key: [u8; PUBLIC_KEY_LEN],
-    program_hash: [u8; UINT160SIZE],
+    pub private_key: [u8; PRIVATE_KEY_LEN],
+    pub public_key: [u8; PUBLIC_KEY_LEN],
+    pub program_hash: [u8; UINT160SIZE],
+    //keypair: Keypair,
 }
 
 impl Account {
@@ -39,6 +41,10 @@ impl Account {
             program_hash,
         })
     }
+
+    // pub fn keypair(&self) -> &Keypair {
+    //     &self.keypair
+    // }
 
     pub fn private_key(&self) -> &[u8; PRIVATE_KEY_LEN] {
         &self.private_key

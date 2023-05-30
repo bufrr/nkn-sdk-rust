@@ -43,10 +43,32 @@
 
 #define WALLET_VERSION 2
 
-typedef struct Account Account;
+typedef struct String String;
 
-typedef struct Result_Wallet__String Result_Wallet__String;
+typedef struct Vec_u8 Vec_u8;
 
 typedef struct WalletConfig WalletConfig;
 
-struct Result_Wallet__String new(struct Account account, struct WalletConfig config);
+typedef struct WalletData WalletData;
+
+typedef struct Account {
+  uint8_t private_key[PRIVATE_KEY_LEN];
+  uint8_t public_key[PUBLIC_KEY_LEN];
+  uint8_t program_hash[UINT160SIZE];
+} Account;
+
+typedef struct Wallet {
+  struct WalletConfig config;
+  struct Account account;
+  struct WalletData wallet_data;
+} Wallet;
+
+struct Wallet random_wallet(void);
+
+char *rust_greeting(const char *to);
+
+void rust_greeting_free(char *s);
+
+struct String to_json(const struct Wallet *self);
+
+struct Vec_u8 to_json_char(const struct Wallet *self);

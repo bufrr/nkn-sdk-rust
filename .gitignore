@@ -16,3 +16,4 @@ Cargo.lock
 
 # User defined
 .idea/
+.DS_Store

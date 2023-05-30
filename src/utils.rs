@@ -1,96 +1,91 @@
-use crate::constants::*;
-use crate::wallet::ScryptConfig;
-use bs58::encode;
-use crypto::aes::{cbc_decryptor, cbc_encryptor, KeySize};
-use crypto::blockmodes::NoPadding;
-use crypto::buffer::{RefReadBuffer, RefWriteBuffer};
-use crypto::digest::Digest;
-use crypto::ripemd160::Ripemd160;
-use crypto::scrypt;
-use crypto::scrypt::{scrypt, ScryptParams};
-use crypto::sha2::Sha256;
-use hex::decode;
+use crate::client::ClientConfig;
+use crate::constants::{
+    CHECKSUM_LEN, CLIENT_SALT_LEN, PRIVATE_KEY_LEN, PUBLIC_KEY_LEN, SHA256_LEN, SHARED_KEY_LEN,
+    SIGNATURE_LEN, UINT160SIZE,
+};
+use crate::crypto::{ed25519_public_key_to_curve25519_public_key, sha256_hash};
+use crate::message::Message;
+use crate::rpc::{Node, RPCConfig};
+use futures_channel::mpsc::unbounded;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sodiumoxide::crypto::box_::{precompute, PublicKey, SecretKey};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::{option, str};
 
-use ed25519_dalek::*;
-use std::io::Read;
+// +1 for avoid affected by lower 192bits shift-add
+const FOOLPROOFPREFIX: &[u8] = &[0x02, 0xb8, 0x25];
 
-const CHECK_SIG: u8 = 0xAC;
-
-pub fn create_program_hash(public_key: &[u8; PUBLIC_KEY_LENGTH]) -> [u8; UINT160SIZE] {
-    to_code_hash(&create_signature_program_code(public_key))
+pub fn client_config_to_rpc_config(config: &ClientConfig) -> RPCConfig {
+    RPCConfig {
+        rpc_server_address: config.rpc_server_address.clone(),
+        rpc_timeout: config.rpc_timeout,
+        rpc_concurrency: config.rpc_concurrency,
+    }
 }
 
-//CODE: len(public_key) + public_key + CHECKSIG
-pub fn create_signature_program_code(public_key: &[u8; PUBLIC_KEY_LENGTH]) -> Vec<u8> {
-    let mut code = Vec::new();
-    code.push(PUBLIC_KEY_LENGTH as u8);
-    code.extend_from_slice(public_key);
-    code.push(CHECK_SIG);
-    code.try_into().unwrap()
+pub fn make_address_string(public_key: &[u8], identifier: String) -> String {
+    let pubkey_str = hex::encode(public_key);
+    if identifier.is_empty() {
+        pubkey_str
+    } else {
+        format!("{identifier}.{pubkey_str}")
+    }
 }
 
-pub fn to_code_hash(code: &[u8]) -> [u8; UINT160SIZE] {
-    ripemd160_hash(&sha256_hash(code))
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StSaltAndSignature {
+    pub client_salt: [u8; CLIENT_SALT_LEN],
+    pub signature: Vec<u8>,
 }
 
-pub fn sha256_hash(input: &[u8]) -> [u8; SHA256_LEN] {
-    let mut hasher = Sha256::new();
-    hasher.input(input);
-    let mut hash = [0u8; SHA256_LEN];
-    hasher.result(&mut hash);
-    hash
+pub fn parse_client_address(
+    address_str: &str,
+) -> Result<([u8; SHA256_LEN], [u8; PUBLIC_KEY_LEN], String), String> {
+    let client_id = sha256_hash(address_str.as_bytes());
+    let substrings: Vec<&str> = address_str.split('.').collect();
+    let public_key_str = substrings.last().unwrap();
+    let public_key = hex::decode(public_key_str)
+        .map_err(|_| "Invalid public key string converting to hex".to_string())?;
+    let identifier = substrings[..substrings.len() - 1].join(".");
+    let key = <&[u8; PUBLIC_KEY_LEN]>::try_from(public_key.as_slice());
+    let k = key.map_err(|_| "Invalid public key string".to_string())?;
+    Ok((client_id, *k, identifier))
 }
 
-pub fn ripemd160_hash(input: &[u8]) -> [u8; RIPEMD160_LEN] {
-    let mut md = Ripemd160::new();
-    md.input(&input);
-    let mut hash = [0u8; RIPEMD160_LEN];
-    md.result(&mut hash);
-    hash
+pub fn get_or_compute_shared_key(
+    remote_public_key: &[u8; PUBLIC_KEY_LEN],
+    curve_secret_key: &[u8; PRIVATE_KEY_LEN],
+    shared_keys: &Arc<Mutex<HashMap<String, [u8; SHARED_KEY_LEN]>>>,
+) -> Result<[u8; SHARED_KEY_LEN], String> {
+    let remote_public_key_str = String::from_utf8_lossy(remote_public_key);
+    let shared_keys_lock = shared_keys.lock().unwrap();
+
+    if let Some(shared_key) = shared_keys_lock.get(remote_public_key_str.as_ref()) {
+        Ok(*shared_key)
+    } else {
+        drop(shared_keys_lock);
+
+        if remote_public_key.len() != PUBLIC_KEY_LEN {
+            return Err("invalid public key size".into());
+        }
+
+        let curve_public_key = ed25519_public_key_to_curve25519_public_key(remote_public_key);
+        let shared_key = precompute(&PublicKey(curve_public_key), &SecretKey(*curve_secret_key));
+
+        shared_keys
+            .lock()
+            .unwrap()
+            .insert(remote_public_key_str.into(), shared_key.0);
+
+        Ok(shared_key.0)
+    }
 }
 
-pub fn code_hash_to_address(hash: &[u8; UINT160SIZE]) -> String {
-    let mut data = Vec::new();
-    data.extend_from_slice(ADDRESS_GEN_PREFIX);
-    data.extend_from_slice(hash);
-
-    let temp = sha256_hash(&data);
-    let temp2 = sha256_hash(&temp);
-    data.extend_from_slice(&temp2[0..CHECKSUM_LEN]);
-
-    bs58::encode(data).into_string()
-}
-
-pub fn scrypt_kdf(password: &str, config: &ScryptConfig) -> [u8; AES_HASH_LEN] {
-    let mut hash = [0u8; AES_HASH_LEN];
-    let params = ScryptParams::new(config.log_n, config.r, config.p);
-    let salt = decode(&config.salt).unwrap();
-    scrypt::scrypt(password.as_bytes(), &salt, &params, &mut hash);
-    hash
-}
-
-pub fn password_to_aes_key_scrypt(password: &str, config: &ScryptConfig) -> [u8; AES_HASH_LEN] {
-    scrypt_kdf(password, config)
-}
-
-pub fn aes_encrypt(input: &[u8], key: &[u8], iv: &[u8]) -> Vec<u8> {
-    let mut encryptor = cbc_encryptor(KeySize::KeySize256, key, iv, NoPadding);
-    let mut input_buf = RefReadBuffer::new(input);
-    let mut output = vec![0u8; input.len()];
-    let mut output_buf = RefWriteBuffer::new(&mut output);
-    encryptor
-        .encrypt(&mut input_buf, &mut output_buf, true)
-        .unwrap();
-    output
-}
-
-pub fn aes_decrypt(input: &[u8], key: &[u8], iv: &[u8]) -> Vec<u8> {
-    let mut decryptor = cbc_decryptor(KeySize::KeySize256, key, iv, NoPadding);
-    let mut input_buf = RefReadBuffer::new(input);
-    let mut output = vec![0u8; input.len()];
-    let mut output_buf = RefWriteBuffer::new(&mut output);
-    decryptor
-        .decrypt(&mut input_buf, &mut output_buf, true)
-        .unwrap();
-    output
+pub fn uint160_from_bytes(bytes: Vec<u8>) -> [u8; UINT160SIZE] {
+    let mut result = [0u8; UINT160SIZE];
+    result.copy_from_slice(&bytes[..UINT160SIZE]);
+    result
 }

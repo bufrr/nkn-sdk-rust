@@ -1,21 +1,61 @@
 use nkn_sdk_rust::account::Account;
-use nkn_sdk_rust::wallet::Wallet;
+use nkn_sdk_rust::client::{Client, ClientConfig};
+use nkn_sdk_rust::message::MessageConfig;
+use std::io;
+use std::str;
+use std::time::Duration;
+use tokio::time::sleep;
 
-fn main() {
-    let acc = Account::new().unwrap();
-    let config = nkn_sdk_rust::wallet::WalletConfig::default();
-    let w = Wallet::new(acc, config).unwrap();
-    let wallet_str = w.to_json();
-    println!("{}", wallet_str);
-
-    //     let wallet_str = String::from(
-    //         r###"{"Version":2,"IV":"9af0d1fc4fa01cad8a75b10ef9d6bcfc","MasterKey":"5acd549e229b28dda16d036ac602d0eff8330ec1f0d14f5b80574d43540766ed","SeedEncrypted":"122336e42053eb891b38c9202899174fd79a3c75b0937fd35add83a55dd66aa5","Address":"NKNafu2vquMeFfDXZMF3JMfFABcBei5gcdWg","Scrypt":{"N":32768,"R":8,"P":1,"Salt":"d920403b67c07ed3"}}
-    // "###,
-    //     );
-
-    // let config2 = nkn_sdk_rust::wallet::WalletConfig::default();
-    // println!("1234");
-    // let w2 = Wallet::from_json(&wallet_str, config2).unwrap();
-    // let wallet_str2 = w2.to_json();
-    // println!("{wallet_str2}");
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let account = Account::new().unwrap();
+    let client_config = ClientConfig::default();
+    let mut client = Client::new(account, None, client_config).unwrap();
+    let to = "";
+    let _ = client.wait_for_connect().unwrap();
+    let _ = client
+        .send_data(&[to], "hello rust".as_bytes(), MessageConfig::default())
+        .await;
+    let msg = client.wait_for_message().unwrap();
+    println!(
+        "msg received: {:?}",
+        str::from_utf8(msg.data.as_slice()).unwrap()
+    );
+    let _ = client
+        .send_data(&[to], "hello nkn".as_bytes(), MessageConfig::default())
+        .await;
+    let msg = client.wait_for_message().unwrap();
+    println!(
+        "msg received: {:?}",
+        str::from_utf8(msg.data.as_slice()).unwrap()
+    );
+    sleep(Duration::from_secs(10000)).await;
+    println!("exit");
+    Ok(())
 }
+
+// fn test() {
+//     let acc = Account::new().unwrap();
+//     let config = nkn_sdk_rust::wallet::WalletConfig::default();
+//     let w = Wallet::new(acc, config).unwrap();
+//
+//     let mut n = 0;
+//     let random_bytes = rand::thread_rng().gen::<[u8; UINT160SIZE]>();
+//     let tx = Transaction::new_transfer_asset(
+//         &random_bytes,
+//         &random_bytes,
+//         234141234,
+//         12311317278,
+//         78978798,
+//     );
+//     let data = tx.encode();
+//     let begin = std::time::SystemTime::now();
+//     while n < 100 {
+//         let _signature = w.sign(data.as_slice());
+//
+//         n += 1;
+//     }
+//     let finish = std::time::SystemTime::now();
+//     let duration = finish.duration_since(begin).unwrap();
+//     println!("duration: {:?}", duration);
+// }
