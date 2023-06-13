@@ -2,11 +2,11 @@ extern crate core;
 
 pub mod account;
 pub mod client;
-mod connect;
 pub mod constants;
 pub mod crypto;
 mod error;
 pub mod message;
+pub mod multiclient;
 mod nanopay;
 mod payload;
 pub mod program;

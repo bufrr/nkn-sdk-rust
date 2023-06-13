@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::{str, time::Duration};
-use tokio::task;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Node {
@@ -115,7 +114,7 @@ pub async fn rpc_call<S: Serialize, D: DeserializeOwned + Send + 'static>(
         let client = client.clone();
         let body = body.clone();
 
-        join_handles.push(task::spawn(async move {
+        join_handles.push(tokio::spawn(async move {
             for address in &addresses {
                 if result.lock().unwrap().is_ok() {
                     return;

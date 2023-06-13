@@ -11,7 +11,7 @@ use crate::pb::node::SyncState;
 use crate::rpc::{get_node_state, get_registrant, get_ws_address, Node, RPCConfig};
 use crate::utils::{
     client_config_to_rpc_config, get_or_compute_shared_key, make_address_string,
-    parse_client_address, StSaltAndSignature,
+    parse_client_address, Channel, StSaltAndSignature,
 };
 use crate::wallet::{Wallet, WalletConfig};
 use prost::bytes::Bytes;
@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::str;
+use std::string::String;
 use std::sync::{mpsc::channel, Arc, Mutex};
 
 use tokio::task;
@@ -39,19 +40,18 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 
+use crossbeam_channel::{bounded, Receiver, Sender};
+
 use futures_util::{future, pin_mut, StreamExt};
 use hex::ToHex;
 use prost::Message as prostMessage;
 use rand::{thread_rng, Rng};
 use std::io::Write;
-use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::time::Duration;
 
 const MAX_CLIENT_MESSAGE_SIZE: usize = 4000000;
 const PING_INTERVAL: u64 = 8;
 const PONG_TIMEOUT: u64 = 10;
-
-type Channel<T> = (Sender<T>, Receiver<T>);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +98,7 @@ impl Default for ClientConfig {
 
 #[derive(Debug)]
 pub struct Client {
-    config: Arc<Mutex<ClientConfig>>,
+    config: ClientConfig,
     wallet: Arc<Mutex<Wallet>>,
     account: Account,
     address: String,
@@ -117,6 +117,9 @@ pub struct Client {
     challenge_signature_channel: Channel<StSaltAndSignature>,
 }
 
+// unsafe impl Sync for Client {}
+// unsafe impl Send for Client {}
+
 impl Client {
     pub fn new(
         account: Account,
@@ -133,20 +136,25 @@ impl Client {
         let wallet = Arc::new(Mutex::new(w));
         let curve_secret_key = ed25519_private_key_to_curve25519_private_key(account.private_key());
         let public_key = account.public_key().clone();
-        let address = make_address_string(&public_key, identifier.unwrap_or_default());
+        let id = match identifier {
+            Some(id) => id,
+            None => String::from(""),
+        };
+
+        let address = make_address_string(&public_key, &id);
         let closed = Arc::new(Mutex::new(false));
         let node = Arc::new(Mutex::new(None));
         let shared_keys = Arc::new(Mutex::new(HashMap::new()));
-        let config = Arc::new(Mutex::new(config));
+        let config = config.clone();
         let response_channels = Arc::new(Mutex::new(HashMap::new()));
         let address_id = sha256_hash(address.as_bytes());
         let sig_chain_block_hash = Arc::new(Mutex::new(None));
         let stdin_tx = Arc::new(Mutex::new(None));
-        let (connect_tx, connect_rx) = channel();
-        let (message_tx, message_rx) = channel();
-        let (reply_tx, reply_rx) = channel();
-        let (reconnect_tx, reconnect_rx) = channel();
-        let challenge_signature_channel = channel();
+        let (connect_tx, connect_rx) = bounded(1);
+        let (message_tx, message_rx) = bounded(1);
+        let (reply_tx, reply_rx) = bounded(1024);
+        let (reconnect_tx, reconnect_rx) = bounded(1);
+        let challenge_signature_channel = bounded(1);
 
         let address_clone = address.clone();
         let private_key = account.private_key().to_vec();
@@ -221,7 +229,7 @@ impl Client {
             .unwrap();
         });
 
-        let ws_write_timeout = config.lock().unwrap().ws_write_timeout;
+        let ws_write_timeout = config.ws_write_timeout;
         let public_key = account.public_key().to_vec();
         let private_key = account.private_key().to_vec();
         let node_clone = node.clone();
@@ -229,7 +237,7 @@ impl Client {
         let reconnect_tx_clone = reconnect_tx.clone();
         let sig_chain_block_hash_clone = sig_chain_block_hash.clone();
         let shared_keys_clone = shared_keys.clone();
-        let rpc_config = client_config_to_rpc_config(&config.lock().unwrap());
+        let rpc_config = client_config_to_rpc_config(&config);
         task::spawn(async move {
             handle_reply(
                 reply_rx,
@@ -270,11 +278,7 @@ impl Client {
     }
 
     pub fn config(&self) -> ClientConfig {
-        self.config.lock().unwrap().clone()
-    }
-
-    pub fn set_config(&mut self, config: ClientConfig) {
-        *self.config.lock().unwrap() = config;
+        self.config.clone()
     }
 
     pub fn private_key(&self) -> &[u8] {
@@ -289,8 +293,9 @@ impl Client {
         *self.closed.lock().unwrap()
     }
 
-    pub fn close(&mut self) {
-        close(self.closed.clone());
+    pub fn close(&mut self) -> Result<(), String> {
+        *self.closed.lock().unwrap() = true;
+        Ok(())
     }
 
     pub fn wait_for_connect(&self) -> Result<Node, String> {
@@ -342,7 +347,7 @@ impl Client {
         self.node.lock().unwrap().clone()
     }
 
-    async fn send_messages(
+    pub async fn send_messages(
         &self,
         dests: &[&str],
         payload: Payload,
@@ -365,7 +370,7 @@ impl Client {
             &self.node,
             &self.sig_chain_block_hash,
             &self.shared_keys,
-            client_config_to_rpc_config(&self.config.lock().unwrap()),
+            client_config_to_rpc_config(&self.config),
         )
         .await
     }
@@ -378,12 +383,12 @@ impl Client {
     ) -> Result<(), String> {
         let message_id = payload.message_id.clone();
 
-        let timeout = self.config.lock().unwrap().ws_write_timeout;
+        let timeout = self.config.ws_write_timeout;
         self.send_messages(
             dests,
             payload,
             !config.unencrypted,
-            config.max_holding_seconds,
+            config.max_holding_secs,
             timeout,
         )
         .await?;
@@ -393,7 +398,7 @@ impl Client {
             self.response_channels
                 .lock()
                 .unwrap()
-                .insert(message_id.into(), channel());
+                .insert(message_id.into(), bounded(1));
         }
 
         Ok(())
@@ -425,7 +430,7 @@ async fn handle_reconnect(
     reconnect_rx: Receiver<()>,
     address: String,
     private_key: Vec<u8>,
-    config: Arc<Mutex<ClientConfig>>,
+    config: ClientConfig,
     closed: Arc<Mutex<bool>>,
     client_node: Arc<Mutex<Option<Node>>>,
     sig_chain_block_hash: Arc<Mutex<Option<String>>>,
@@ -446,7 +451,7 @@ async fn handle_reconnect(
             return;
         }
 
-        let min_reconnect_interval = config.lock().unwrap().min_reconnect_interval;
+        let min_reconnect_interval = config.min_reconnect_interval;
         log::info!("Reconnect in {} ms...", min_reconnect_interval);
         sleep(Duration::from_millis(min_reconnect_interval)).await;
 
@@ -476,21 +481,16 @@ async fn handle_reconnect(
 
         if let Err(err) = res {
             log::error!("Error: {}", err);
-            close(closed.clone());
+            //close(closed.clone());
         }
     }
-}
-
-fn close(closed: Arc<Mutex<bool>>) {
-    *closed.lock().unwrap() = true;
-    todo!(); // close connection
 }
 
 async fn connect(
     max_retries: u32,
     address: String,
     private_key: Vec<u8>,
-    config: Arc<Mutex<ClientConfig>>,
+    config: ClientConfig,
     closed: Arc<Mutex<bool>>,
     client_node: Arc<Mutex<Option<Node>>>,
     sig_chain_block_hash: Arc<Mutex<Option<String>>>,
@@ -504,9 +504,9 @@ async fn connect(
     curve_secret_key: [u8; SHARED_KEY_LEN],
     shared_keys: Arc<Mutex<HashMap<String, [u8; SHARED_KEY_LEN]>>>,
 ) -> Result<(), String> {
-    let max_reconnect_interval = config.lock().unwrap().max_reconnect_interval;
+    let max_reconnect_interval = config.max_reconnect_interval;
 
-    let mut retry_interval = config.lock().unwrap().min_reconnect_interval;
+    let mut retry_interval = config.min_reconnect_interval;
     let mut retry = 0;
 
     while max_retries == 0 || retry < max_retries {
@@ -520,7 +520,7 @@ async fn connect(
             }
         }
 
-        let rpc_config = client_config_to_rpc_config(&config.lock().unwrap());
+        let rpc_config = client_config_to_rpc_config(&config);
         let res = get_ws_address(&address, rpc_config).await;
 
         match res {
@@ -567,7 +567,7 @@ async fn connect_to_node(
     node: Node,
     address: String,
     private_key: Vec<u8>,
-    config: Arc<Mutex<ClientConfig>>,
+    config: ClientConfig,
     closed: Arc<Mutex<bool>>,
     client_node: Arc<Mutex<Option<Node>>>,
     sig_chain_block_hash: Arc<Mutex<Option<String>>>,
@@ -588,7 +588,7 @@ async fn connect_to_node(
         let handle = task::spawn(async move {
             let addr = format!("http://{}", node.rpc_addr);
 
-            let ws_handshake_timeout = config.lock().unwrap().ws_handshake_timeout;
+            let ws_handshake_timeout = config.ws_handshake_timeout;
             let node_state = match get_node_state(RPCConfig {
                 rpc_server_address: vec![addr.clone()],
                 rpc_timeout: ws_handshake_timeout,
@@ -621,26 +621,31 @@ async fn connect_to_node(
     let (stdin_tx_new, stdin_rx) = unbounded();
     *stdin_tx.lock().unwrap() = Some(stdin_tx_new);
 
-    let (txx, rxx) = sync_channel(1);
+    let (txx, rxx) = bounded(1);
     let stdin_to_ws = stdin_rx.map(Ok).forward(write);
 
     tokio::spawn(async move {
         let ws_to_stdout = {
             read.for_each(|message| async {
-                let data = match message.unwrap() {
-                    WsMessage::Text(text) => {
-                        let mut data = text.as_bytes().to_vec();
-                        data.push(0);
-                        data
+                match message {
+                    Ok(message) => {
+                        let data = match message {
+                            WsMessage::Text(text) => {
+                                let mut data = text.as_bytes().to_vec();
+                                data.push(0);
+                                data
+                            }
+                            WsMessage::Binary(mut data) => {
+                                data.push(1);
+                                data
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !data.is_empty() {
+                            txx.send(data).unwrap();
+                        }
                     }
-                    WsMessage::Binary(mut data) => {
-                        data.push(1);
-                        data
-                    }
-                    _ => Vec::new(),
-                };
-                if !data.is_empty() {
-                    txx.send(data).unwrap();
+                    Err(err) => log::error!("Error: {err}"),
                 }
             })
         };
@@ -701,10 +706,16 @@ async fn connect_to_node(
     let address_clone = address.clone();
     let stdin_tx_clone = stdin_tx.clone();
     let reconnect_tx_clone = reconnect_tx.clone();
-    let (challenge_tx, mut challenge_rx) = sync_channel::<StSaltAndSignature>(100);
+    let (challenge_tx, mut challenge_rx) = bounded::<StSaltAndSignature>(100);
 
     tokio::spawn(async move {
-        let v = challenge_rx.recv().unwrap();
+        let v = match challenge_rx.recv() {
+            Ok(v) => v,
+            Err(err) => {
+                log::error!("Error: {err}");
+                return;
+            }
+        };
         let salt = v.client_salt.encode_hex::<String>();
         let signature = v.signature.encode_hex::<String>();
         let req = json!({
@@ -787,7 +798,7 @@ async fn handle_message(
     data: Vec<u8>,
     address: String,
     private_key: Vec<u8>,
-    config: Arc<Mutex<ClientConfig>>,
+    config: ClientConfig,
     closed: Arc<Mutex<bool>>,
     client_node: Arc<Mutex<Option<Node>>>,
     sig_chain_block_hash: Arc<Mutex<Option<String>>>,
@@ -800,7 +811,7 @@ async fn handle_message(
     response_channels: Arc<Mutex<HashMap<String, Channel<Message>>>>,
     curve_secret_key: [u8; SHARED_KEY_LEN],
     shared_keys: Arc<Mutex<HashMap<String, [u8; SHARED_KEY_LEN]>>>,
-    challenge_tx: SyncSender<StSaltAndSignature>,
+    challenge_tx: Sender<StSaltAndSignature>,
 ) -> Result<(), String> {
     if *closed.lock().unwrap() {
         return Ok(());
@@ -811,11 +822,12 @@ async fn handle_message(
         let action = msg["Action"].as_str().unwrap();
         let error: NKNError = NKNError::from(msg["Error"].as_i64().unwrap());
 
-        println!("msg: {msg}");
+        log::info!("msg: {msg}");
         if error != NKNError::Success {
             if error == NKNError::WrongNode {
+                todo!()
             } else if action == "setClient" {
-                close(closed);
+                //close(closed);
             }
 
             return Err("Error".into());
@@ -910,7 +922,7 @@ async fn handle_message(
 
                 if !payload.reply_to_id.is_empty() {
                     let mut response_channels = response_channels.lock().unwrap();
-                    let msg_id_str = str::from_utf8(&payload.reply_to_id).unwrap().to_string();
+                    let msg_id_str = hex::encode(&payload.reply_to_id).to_string();
                     let channel = response_channels.get(&msg_id_str);
 
                     if let Some((response_tx, _)) = channel {
@@ -977,7 +989,7 @@ async fn handle_reply(
     }
 }
 
-async fn send_messages(
+pub async fn send_messages(
     dests: &[&str],
     payload: Payload,
     encrypted: bool,
@@ -1078,8 +1090,12 @@ async fn send_messages(
         client_msg
             .encode(&mut msg)
             .expect("encode client message failed");
-        write_message(msg.as_slice(), stdin_tx.clone(), reconnect_tx.clone())
-            .expect("write message failed");
+        match write_message(msg.as_slice(), stdin_tx.clone(), reconnect_tx.clone()) {
+            Ok(res) => res,
+            Err(err) => {
+                log::error!("Error: {}", err);
+            }
+        };
     }
 
     Ok(())
@@ -1179,7 +1195,7 @@ fn decrypt_payload(
     }
 }
 
-async fn process_dests(dests: &[&str], rpc_config: RPCConfig) -> Result<Vec<String>, String> {
+pub async fn process_dests(dests: &[&str], rpc_config: RPCConfig) -> Result<Vec<String>, String> {
     if dests.is_empty() {
         return Ok(Vec::new());
     }
@@ -1367,11 +1383,12 @@ fn write_message(
         .unwrap()
         .unbounded_send(WsMessage::Binary(data.to_vec()));
 
-    if let Err(err) = res {
-        reconnect_tx.send(()).unwrap();
-        Err("Websocket message failed".into())
-    } else {
-        Ok(())
+    match res {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            //reconnect_tx.send(()).unwrap();
+            Err(err.to_string())
+        }
     }
 }
 

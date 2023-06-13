@@ -1,10 +1,5 @@
-use crate::constants::{NONCE_SIZE, SHARED_KEY_LEN};
-use crate::pb;
-use crate::pb::payloads::{Payload, PayloadType};
-use sodiumoxide::crypto::aead::xchacha20poly1305_ietf::TAGBYTES;
-use sodiumoxide::crypto::box_::curve25519xsalsa20poly1305::*;
-use sodiumoxide::crypto::{aead, box_};
-use std::sync::mpsc::Sender;
+use crate::pb::payloads::Payload;
+use crossbeam_channel::Sender;
 
 pub type Reply = (String, Payload, bool);
 
@@ -12,7 +7,7 @@ pub type Reply = (String, Payload, bool);
 pub struct MessageConfig {
     pub unencrypted: bool,
     pub no_reply: bool,
-    pub max_holding_seconds: u32,
+    pub max_holding_secs: u32,
     pub message_id: Vec<u8>,
     pub tx_pool: bool,
     pub offset: u32,
@@ -24,7 +19,7 @@ impl Default for MessageConfig {
         Self {
             unencrypted: false,
             no_reply: false,
-            max_holding_seconds: 0,
+            max_holding_secs: 10000,
             message_id: Vec::new(),
             tx_pool: false,
             offset: 0,
@@ -33,7 +28,7 @@ impl Default for MessageConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub src: String,
     pub data: Vec<u8>,
@@ -62,7 +57,6 @@ impl Message {
         Ok(())
     }
 }
-
 
 // fn new_text_payload(text: &str, message_id: &[u8], no_reply: bool) -> Result<Payload, String> {
 //     let mut payload = Payload {

@@ -27,10 +27,14 @@ hyper-tls = "0.5"
 tokio = { version = "1.28.0", features = ["rt-multi-thread", "io-std", "rt", "macros"] }
 tokio-tungstenite = "*"
 url = "2"
+futures = "0.3"
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log = "*"
 flate2 = "*"
+moka = { version = "0.11", features = ["future"] }
+regex = "*"
+crossbeam-channel = "*"
 
 
 [build-dependencies]

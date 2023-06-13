@@ -4,15 +4,20 @@ use crate::constants::{
     SIGNATURE_LEN, UINT160SIZE,
 };
 use crate::crypto::{ed25519_public_key_to_curve25519_public_key, sha256_hash};
-use crate::message::Message;
-use crate::rpc::{Node, RPCConfig};
-use futures_channel::mpsc::unbounded;
+use crate::rpc::RPCConfig;
+use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sodiumoxide::crypto::box_::{precompute, PublicKey, SecretKey};
 use std::collections::HashMap;
+use std::str;
+use std::string;
 use std::sync::{Arc, Mutex};
-use std::{option, str};
+
+//static RE: Regex = Regex::new(r"^__\\d+__$").unwrap();
+
+pub(crate) type Channel<T> = (Sender<T>, Receiver<T>);
 
 // +1 for avoid affected by lower 192bits shift-add
 const FOOLPROOFPREFIX: &[u8] = &[0x02, 0xb8, 0x25];
@@ -25,7 +30,7 @@ pub fn client_config_to_rpc_config(config: &ClientConfig) -> RPCConfig {
     }
 }
 
-pub fn make_address_string(public_key: &[u8], identifier: String) -> String {
+pub fn make_address_string(public_key: &[u8], identifier: &String) -> String {
     let pubkey_str = hex::encode(public_key);
     if identifier.is_empty() {
         pubkey_str
@@ -88,4 +93,41 @@ pub fn uint160_from_bytes(bytes: Vec<u8>) -> [u8; UINT160SIZE] {
     let mut result = [0u8; UINT160SIZE];
     result.copy_from_slice(&bytes[..UINT160SIZE]);
     result
+}
+
+pub fn add_identifier(addr: String, id: i32) -> String {
+    if id < 0 {
+        return addr;
+    }
+    let underscore = "__";
+    add_identifier_prefix(addr, format!("{underscore}{id}{underscore}"))
+}
+
+pub fn add_identifier_prefix(base: String, prefix: String) -> String {
+    if prefix.is_empty() {
+        return base;
+    }
+    if base.is_empty() {
+        return prefix;
+    }
+
+    format!("{prefix}.{base}")
+}
+
+pub fn add_multiclient_prefix(dest: &Vec<String>, client_id: i32) -> Vec<String> {
+    let mut result = Vec::new();
+    for addr in dest {
+        result.push(add_identifier(addr.clone(), client_id));
+    }
+    result
+}
+
+pub fn remote_identifier(src: String) -> (String, String) {
+    let s = src.split('.').collect::<Vec<&str>>();
+    let RE: Regex = Regex::new(r"^__\\d+__$").unwrap();
+
+    if s.len() > 1 && RE.is_match(s[0]) {
+        return (s[0].to_string(), s[1].to_string());
+    }
+    (src, "".to_string())
 }
