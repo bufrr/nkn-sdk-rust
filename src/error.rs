@@ -97,3 +97,6 @@ impl From<i64> for NKNError {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+struct DoubleError;

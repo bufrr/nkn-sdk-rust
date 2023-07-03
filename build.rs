@@ -10,6 +10,7 @@ fn main() -> Result<()> {
             "protos/clientmessage.proto",
             "protos/nodemessage.proto",
             "protos/block.proto",
+            "protos/packet.proto",
         ],
         &["protos/"],
     )?;

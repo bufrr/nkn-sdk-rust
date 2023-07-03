@@ -35,6 +35,7 @@ flate2 = "*"
 moka = { version = "0.11", features = ["future"] }
 regex = "*"
 crossbeam-channel = "*"
+tokio-context = "*"
 
 
 [build-dependencies]

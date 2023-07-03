@@ -2,6 +2,7 @@ extern crate core;
 
 pub mod account;
 pub mod client;
+mod connection;
 pub mod constants;
 pub mod crypto;
 mod error;
@@ -12,6 +13,7 @@ mod payload;
 pub mod program;
 mod rpc;
 mod serialization;
+pub mod session;
 mod sigchain;
 pub mod signature;
 pub mod tx;
@@ -39,6 +41,9 @@ pub mod pb {
     }
     pub mod clientmessage {
         include!(concat!(env!("OUT_DIR"), "/pb.clientmessage.rs"));
+    }
+    pub mod packet {
+        include!(concat!(env!("OUT_DIR"), "/pb.packet.rs"));
     }
 }
 
