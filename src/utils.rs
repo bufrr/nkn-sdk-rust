@@ -5,12 +5,14 @@ use crate::constants::{
 };
 use crate::crypto::{ed25519_public_key_to_curve25519_public_key, sha256_hash};
 use crate::rpc::RPCConfig;
+use crate::session::MIN_SEQUENCE_ID;
 use crossbeam_channel::bounded;
 use crossbeam_channel::{Receiver, Sender};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sodiumoxide::crypto::box_::{precompute, PublicKey, SecretKey};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::str;
 use std::string;
 use std::sync::{Arc, Mutex};
@@ -130,4 +132,72 @@ pub fn remote_identifier(src: String) -> (String, String) {
         return (s[0].to_string(), s[1].to_string());
     }
     (src, "".to_string())
+}
+
+pub fn next_seq(seq: u32, step: i64) -> u32 {
+    let max: i64 = (u32::MAX - MIN_SEQUENCE_ID + 1) as i64;
+    let mut res = (seq as i64 - MIN_SEQUENCE_ID as i64 + step) % max;
+    if res < 0 {
+        res += max;
+    }
+    (res + MIN_SEQUENCE_ID as i64) as u32
+}
+
+pub fn seq_in_between(seq: u32, start: u32, end: u32) -> bool {
+    if start <= end {
+        return seq >= start && seq < end;
+    }
+    seq >= start || seq < end
+}
+
+pub fn compare_seq(a: u32, b: u32) -> i32 {
+    if a == b {
+        return 0;
+    }
+    if a < b {
+        if b - a < u32::MAX / 2 {
+            return -1;
+        }
+        return 1;
+    }
+    if a - b < u32::MAX / 2 {
+        return 1;
+    }
+    -1
+}
+
+pub fn conn_key(local_client_id: String, remote_client_id: String) -> String {
+    format!("{local_client_id} - {remote_client_id}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqElem {
+    pub v: u32,
+}
+pub type SeqHeap = BinaryHeap<SeqElem>;
+
+impl PartialOrd<Self> for SeqElem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let res = compare_seq(self.v, other.v);
+        if res == 0 {
+            Some(Ordering::Equal)
+        } else if res == -1 {
+            Some(Ordering::Less)
+        } else {
+            Some(Ordering::Greater)
+        }
+    }
+}
+
+impl Ord for SeqElem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let res = compare_seq(self.v, other.v);
+        if res == 0 {
+            Ordering::Equal
+        } else if res == -1 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
 }

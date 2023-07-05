@@ -7,7 +7,9 @@ use tokio::net::unix::SocketAddr;
 
 use crate::pb::packet::Packet;
 
-type SendWith = fn(String, String, Vec<u8>, Duration) -> Result<(), String>;
+type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
+
+pub const MIN_SEQUENCE_ID: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct NcpConfig {
@@ -15,13 +17,13 @@ pub struct NcpConfig {
     pub session_window_size: i32,
     pub mtu: i32,
     pub min_connection_window_size: i32,
-    pub max_ask_seq_list_size: i32,
+    pub max_ask_seq_list_size: usize,
     pub flush_interval: i32,
     pub linger: i32,
     pub initial_retransmission_timeout: i32,
     pub max_retransmission_timeout: i32,
-    pub send_ack_interval: i32,
-    pub check_timeout_interval: i32,
+    pub send_ack_interval: u64,
+    pub check_timeout_interval: u64,
     pub send_bytes_read_threshold: i32,
 }
 
@@ -46,13 +48,13 @@ impl Default for NcpConfig {
 
 #[derive(Debug)]
 pub struct Session {
-    config: NcpConfig,
+    pub(crate) config: NcpConfig,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     local_client_ids: Vec<String>,
     remote_client_ids: Vec<String>,
 
-    send_with: SendWith,
+    pub send_with: SendWith,
     send_window_size: u32,
     recv_window_size: u32,
     send_mtu: u32,
