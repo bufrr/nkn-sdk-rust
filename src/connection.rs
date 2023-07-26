@@ -4,25 +4,25 @@ use std::collections::{BinaryHeap, HashMap};
 use std::mem::replace;
 
 use crate::pb::packet::Packet;
-use crate::utils::{next_seq, SeqHeap};
-use futures_util::{join, try_join};
+use crate::utils::{next_seq, SeqElem, SeqHeap};
+use futures_util::join;
 use prost::Message;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct Connection {
-    config: NcpConfig,
     pub local_client_id: String,
     pub remote_client_id: String,
-    window_size: f64,
+    config: NcpConfig,
+    pub window_size: f64,
     send_window_update_tx: Sender<()>,
     send_window_update_rx: Receiver<()>,
-    //time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    //resent_seq: Arc<Mutex<HashMap<u32, ()>>>,
-    send_ack_queue: SeqHeap,
-    retransmission_timeout: u64,
+    time_sent_seq: Arc<RwLock<HashMap<u32, SystemTime>>>,
+    resent_seq: Arc<RwLock<HashMap<u32, ()>>>,
+    send_ack_queue: Arc<RwLock<SeqHeap>>,
+    retransmission_timeout: Arc<RwLock<Duration>>,
 }
 
 impl Connection {
@@ -35,29 +35,34 @@ impl Connection {
             window_size,
             send_window_update_tx,
             send_window_update_rx,
-            //time_sent_seq: Arc::new(Mutex::new(HashMap::new())),
-            //resent_seq: Arc::new(Mutex::new(HashMap::new())),
-            send_ack_queue: BinaryHeap::new(),
-            retransmission_timeout: 5000,
+            time_sent_seq: Arc::new(RwLock::new(HashMap::new())),
+            resent_seq: Arc::new(RwLock::new(HashMap::new())),
+            send_ack_queue: Arc::new(RwLock::new(BinaryHeap::new())),
+            retransmission_timeout: Arc::new(RwLock::new(Duration::from_millis(5000))),
         }
     }
 
-    // pub fn send_window_used(&self) -> u32 {
-    //     self.time_sent_seq.lock().unwrap().len() as u32
-    // }
-
-    pub fn send_ack_queue_len(&self) -> usize {
-        self.send_ack_queue.len()
+    pub fn send_window_used(&self) -> u32 {
+        self.time_sent_seq.read().unwrap().len() as u32
     }
 
-    pub fn wait_for_send_window(
-        &self,
-        time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    ) -> Result<(), String> {
+    pub fn retransmission_timeout(&self) -> Duration {
+        *self.retransmission_timeout.read().unwrap()
+    }
+
+    pub fn send_ack(&self, seq: u32) {
+        let seq = SeqElem::new(seq);
+        self.send_ack_queue.write().unwrap().push(seq);
+    }
+
+    pub fn send_ack_queue_len(&self) -> usize {
+        self.send_ack_queue.read().unwrap().len()
+    }
+
+    pub fn wait_for_send_window(&self) -> Result<(), String> {
         let send_window_update_rx_clone = self.send_window_update_rx.clone();
         let timeout = after(Duration::from_secs(1));
-        let tss = time_sent_seq.lock().unwrap();
-        while tss.len() >= self.window_size as usize {
+        while self.send_window_used() >= self.window_size as u32 {
             select! {
                 recv(send_window_update_rx_clone) -> _ => {}
                 recv(timeout) -> _ => {
@@ -68,15 +73,55 @@ impl Connection {
 
         Ok(())
     }
+
+    pub fn receive_ack(&mut self, sequence_id: u32, is_sent_by_me: bool) {
+        let time_sent_seq = self.time_sent_seq.read().unwrap();
+        let t = time_sent_seq.get(&sequence_id).unwrap();
+
+        let resent_seq = self.resent_seq.read().unwrap();
+        match resent_seq.get(&sequence_id) {
+            Some(_) => {}
+            None => {
+                let size = self.window_size + 1.0;
+                //set_window_size(&mut conn.window_size, size);
+            }
+        };
+
+        if is_sent_by_me {
+            let rtt = SystemTime::now().duration_since(*t).unwrap();
+            let timeout = self.retransmission_timeout();
+            let d = (3 * rtt - timeout).as_nanos() as f64
+                / (Duration::from_millis(1000)).as_nanos() as f64
+                * Duration::from_millis(100).as_nanos() as f64;
+            let ms = Duration::from_nanos(d.tanh() as u64);
+            *self.retransmission_timeout.write().unwrap() = ms;
+            if ms.as_millis() > self.config.max_retransmission_timeout as u128 {
+                *self.retransmission_timeout.write().unwrap() =
+                    Duration::from_millis(self.config.max_retransmission_timeout as u64);
+            }
+        }
+
+        self.time_sent_seq.write().unwrap().remove(&sequence_id);
+        self.resent_seq.write().unwrap().remove(&sequence_id);
+
+        self.send_window_update_tx
+            .send_timeout((), Duration::from_secs(0))
+            .expect("send error");
+    }
+
+    pub fn set_window_size(&mut self, mut n: f64, min_connection_window_size: f64) {
+        if n < min_connection_window_size {
+            n = min_connection_window_size;
+        }
+        self.window_size = n
+    }
 }
 
-pub async fn start(
+pub async fn start_conn(
     conn: Arc<Mutex<Connection>>,
     session: Arc<Mutex<Session>>,
     config: NcpConfig,
-    send_window_data: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
-    time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    resent_seq: Arc<Mutex<HashMap<u32, ()>>>,
+    send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
     resend_rx: Receiver<u32>,
     resend_tx: Sender<u32>,
@@ -86,36 +131,22 @@ pub async fn start(
             conn.clone(),
             session.clone(),
             send_window_data.clone(),
-            time_sent_seq.clone(),
-            resent_seq.clone(),
             send_rx.clone(),
             resend_rx.clone(),
         ),
         send_ack(conn.clone(), session.clone(), config.clone()),
-        check_timeout(
-            conn.clone(),
-            session.clone(),
-            time_sent_seq.clone(),
-            resent_seq.clone(),
-            resend_tx.clone(),
-        )
+        check_timeout(conn.clone(), session.clone(), resend_tx.clone(),)
     );
-}
-
-pub fn set_window_size(dest: &mut f64, src: f64) {
-    let _ = replace(dest, src);
 }
 
 async fn tx(
     conn: Arc<Mutex<Connection>>,
     session: Arc<Mutex<Session>>,
-    send_window_data: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
-    time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    resent_seq: Arc<Mutex<HashMap<u32, ()>>>,
+    send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
     resend_rx: Receiver<u32>,
 ) {
-    let conn = conn.lock().unwrap();
+    let mut conn = conn.lock().unwrap();
     let mut seq = 0;
     loop {
         if seq == 0 {
@@ -125,7 +156,7 @@ async fn tx(
             }
         }
         if seq == 0 {
-            let res = conn.wait_for_send_window(time_sent_seq.clone());
+            let res = conn.wait_for_send_window();
             if res.is_err() {
                 return;
             }
@@ -134,36 +165,50 @@ async fn tx(
                 recv(resend_rx) -> s => seq = s.unwrap(),
             }
         }
-        let send_window_data = send_window_data.lock().unwrap();
+
+        let send_window_data = send_window_data.read().unwrap();
         let buf = send_window_data.get(&seq).unwrap();
         if buf.len() == 0 {
-            time_sent_seq.lock().unwrap().remove(&seq);
-            resent_seq.lock().unwrap().remove(&seq);
+            let mut time_sent_seq = conn.time_sent_seq.write().unwrap();
+            let mut resent_seq = conn.resent_seq.write().unwrap();
+            time_sent_seq.remove(&seq);
+            resent_seq.remove(&seq);
             seq = 0;
             continue;
         }
-        let send_with = session.lock().unwrap().send_with;
-        let res = send_with(
-            conn.local_client_id.clone(),
-            conn.local_client_id.clone(),
-            buf,
-            Duration::from_secs(0),
-        );
-        match res {
-            Ok(_) => {}
-            Err(_) => {
-                seq = 0;
+
+        {
+            let session = session.lock().unwrap();
+            let send_with = session.send_with;
+            let res = send_with(
+                conn.local_client_id.clone(),
+                conn.local_client_id.clone(),
+                buf,
+                Duration::from_secs(0),
+            );
+            match res {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("send_with error: {:?}", err);
+                    let window_size = conn.window_size;
+                    conn.set_window_size(window_size / 2.0, 1.0);
+                    //session.update_conn_window_size TODO
+                    seq = 0;
+                }
             }
         }
+
         {
-            let mut tss = time_sent_seq.lock().unwrap();
+            let mut tss = conn.time_sent_seq.write().unwrap();
+            let mut resent_seq = conn.resent_seq.write().unwrap();
+
             let _ = match tss.get(&seq) {
                 None => {
                     tss.insert(seq, SystemTime::now());
                 }
                 Some(_) => {}
             };
-            tss.remove(&seq);
+            resent_seq.remove(&seq);
 
             seq = 0;
         }
@@ -191,13 +236,15 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
                 {
                     break;
                 }
-                let ack_start_seq = c.send_ack_queue.pop().unwrap();
+
+                let mut send_ack_queue = c.send_ack_queue.write().unwrap();
+                let ack_start_seq = send_ack_queue.pop().unwrap();
                 let mut ack_seq_count: u32 = 1;
-                while c.send_ack_queue.len() > 0
-                    && c.send_ack_queue.peek().unwrap().v
+                while send_ack_queue.len() > 0
+                    && send_ack_queue.peek().unwrap().v
                         == next_seq(ack_start_seq.v, ack_seq_count as i64)
                 {
-                    c.send_ack_queue.pop();
+                    send_ack_queue.pop();
                     ack_seq_count += 1;
                 }
                 ack_start_seq_list.push(ack_start_seq.v);
@@ -245,20 +292,20 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
 async fn check_timeout(
     conn: Arc<Mutex<Connection>>,
     session: Arc<Mutex<Session>>,
-    time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    resent_seq: Arc<Mutex<HashMap<u32, ()>>>,
     resend_tx: Sender<u32>,
 ) {
     let sess = session.lock().unwrap();
     let config = sess.config.clone();
     drop(sess);
+    let mut new_resend = false;
     loop {
-        let c = conn.lock().unwrap();
         sleep(Duration::from_secs(config.check_timeout_interval));
-        let threshold = SystemTime::now() - Duration::from_millis(c.retransmission_timeout);
-        let mut new_resend = false;
-        let tss = time_sent_seq.lock().unwrap();
-        let mut rss = resent_seq.lock().unwrap();
+
+        let conn = conn.lock().unwrap();
+        let threshold = SystemTime::now() - conn.retransmission_timeout();
+
+        let tss = conn.time_sent_seq.read().unwrap();
+        let mut rss = conn.resent_seq.write().unwrap();
         for (seq, t) in tss.iter() {
             if rss.contains_key(seq) {
                 continue;
@@ -269,50 +316,8 @@ async fn check_timeout(
                 new_resend = true;
             }
         }
-    }
-    // todo update window size
-}
-
-pub async fn receive_ack(
-    conn: Arc<Mutex<Connection>>,
-    time_sent_seq: Arc<Mutex<HashMap<u32, SystemTime>>>,
-    resent_seq: Arc<Mutex<HashMap<u32, ()>>>,
-    sequence_id: u32,
-    is_sent_by_me: bool,
-) -> Result<(), String> {
-    let mut conn = conn.lock().unwrap();
-    let seq = time_sent_seq.lock().unwrap();
-    let t = match seq.get(&sequence_id) {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    match resent_seq.lock().unwrap().get(&sequence_id) {
-        Some(_) => {}
-        None => {
-            let size = conn.window_size + 1.0;
-            //set_window_size(&mut conn.window_size, size);
+        if new_resend {
+            // todo update window size
         }
-    };
-
-    if is_sent_by_me {
-        let rtt = SystemTime::now().duration_since(*t).unwrap();
-        let timeout = Duration::from_millis(conn.retransmission_timeout);
-        let d = (3 * rtt - timeout).as_nanos() as f64
-            / (Duration::from_millis(1000)).as_nanos() as f64
-            * Duration::from_millis(100).as_nanos() as f64;
-        let ms = Duration::from_nanos(d.tanh() as u64);
-        conn.retransmission_timeout = ms.as_millis() as u64;
-        // *self.retransmission_timeout.lock().unwrap() +=
-        // Duration::from_millis(100);
     }
-
-    time_sent_seq.lock().unwrap().remove(&sequence_id);
-    resent_seq.lock().unwrap().remove(&sequence_id);
-
-    conn.send_window_update_tx
-        .send_timeout((), Duration::from_secs(0))
-        .expect("send error");
-
-    Ok(())
 }

@@ -174,6 +174,14 @@ pub fn conn_key(local_client_id: String, remote_client_id: String) -> String {
 pub struct SeqElem {
     pub v: u32,
 }
+
+impl SeqElem {
+    pub fn new(v: u32) -> Self {
+        Self { v }
+    }
+}
+//pub type SeqElem = u32;
+
 pub type SeqHeap = BinaryHeap<SeqElem>;
 
 impl PartialOrd<Self> for SeqElem {
