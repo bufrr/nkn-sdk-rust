@@ -2,18 +2,17 @@ use crate::connection::{start_conn, Connection};
 use crate::pb::packet::Packet;
 use crate::utils::{conn_key, next_seq, Channel};
 use crossbeam_channel::{bounded, select, tick};
-use futures::pin_mut;
-use futures_util::future::{join, select_ok};
+use futures_util::future::{join_all, select_ok};
 use prost::Message;
 use std::collections::HashMap;
 use std::ops::Sub;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use tokio::net::unix::SocketAddr;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::RwLock as AsyncRwlock;
-use tokio::{join, spawn};
+use tokio::spawn;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
 
@@ -67,7 +66,7 @@ pub struct Session {
     recv_window_size: u32,
     send_mtu: u32,
     recv_mtu: u32,
-    connections: Arc<AsyncRwlock<HashMap<String, Connection>>>,
+    connections: Arc<RwLock<HashMap<String, Connection>>>,
 
     is_accepted: Arc<RwLock<bool>>,
     is_established: Arc<RwLock<bool>>,
@@ -126,7 +125,7 @@ impl Session {
             send_buffer: Arc::new(RwLock::new(Vec::new())),
             send_window_start_seq: Arc::new(RwLock::new(MIN_SEQUENCE_ID)),
             send_window_end_seq: Arc::new(RwLock::new(MIN_SEQUENCE_ID)),
-            connections: Arc::new(AsyncRwlock::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(HashMap::new())),
             send_with,
             send_window_data: Arc::new(RwLock::new(HashMap::new())),
             recv_window_start_seq: Arc::new(RwLock::new(MIN_SEQUENCE_ID)),
@@ -150,35 +149,35 @@ impl Session {
         !self.config.non_stream
     }
 
-    pub fn is_established(&self) -> bool {
-        return *self.is_established.read().unwrap();
+    pub async fn is_established(&self) -> bool {
+        *self.is_established.read().await
     }
 
-    pub fn is_closed(&self) -> bool {
-        return *self.is_closed.read().unwrap();
+    pub async fn is_closed(&self) -> bool {
+        *self.is_closed.read().await
     }
 
-    pub fn get_bytes_read(&self) -> u64 {
-        return *self.bytes_read.read().unwrap();
+    pub async fn get_bytes_read(&self) -> u64 {
+        *self.bytes_read.read().await
     }
 
-    pub fn update_bytes_read_sent_time(&self) {
-        *self.bytes_read_sent_time.write().unwrap() = SystemTime::now();
+    pub async fn update_bytes_read_sent_time(&self) {
+        *self.bytes_read_sent_time.write().await = SystemTime::now();
     }
 
-    pub fn send_window_used(&self) -> u32 {
-        let bytes_write = self.bytes_write.read().unwrap();
-        let remote_bytes_read = self.remote_bytes_read.read().unwrap();
+    pub async fn send_window_used(&self) -> u32 {
+        let bytes_write = self.bytes_write.read().await;
+        let remote_bytes_read = self.remote_bytes_read.read().await;
         let res = bytes_write.checked_sub(*remote_bytes_read).unwrap_or(0);
         res as u32
     }
 
-    pub fn recv_window_used(&self) -> u32 {
-        *self.recv_window_used.read().unwrap()
+    pub async fn recv_window_used(&self) -> u32 {
+        *self.recv_window_used.read().await
     }
 
-    pub fn get_data_to_send(&self, sequence_id: u32) -> Vec<u8> {
-        let send_window_data = self.send_window_data.read().unwrap();
+    pub async fn get_data_to_send(&self, sequence_id: u32) -> Vec<u8> {
+        let send_window_data = self.send_window_data.read().await;
         send_window_data.get(&sequence_id).unwrap().clone()
     }
 
@@ -245,13 +244,13 @@ impl Session {
         }
     }
 
-    pub fn flush_send_buffer(&self) {
-        let mut send_buffer = self.send_buffer.write().unwrap();
+    pub async fn flush_send_buffer(&self) {
+        let mut send_buffer = self.send_buffer.write().await;
         if send_buffer.len() == 0 {
             return;
         }
 
-        let seq = self.send_window_end_seq.read().unwrap();
+        let seq = self.send_window_end_seq.read().await;
         let p = Packet {
             sequence_id: *seq,
             data: send_buffer.clone(),
@@ -260,8 +259,8 @@ impl Session {
         let mut buf = Vec::new();
         p.encode(&mut buf).unwrap();
 
-        let mut send_window_data = self.send_window_data.write().unwrap();
-        let mut send_window_end_seq = self.send_window_end_seq.write().unwrap();
+        let mut send_window_data = self.send_window_data.write().await;
+        let mut send_window_end_seq = self.send_window_end_seq.write().await;
         send_window_data.insert(*seq, buf);
         *send_window_end_seq = next_seq(*seq, 1);
         send_buffer.clear();
@@ -274,22 +273,22 @@ impl Session {
         loop {
             sleep(Duration::from_millis(self.config.flush_interval as u64));
             {
-                let buffer = self.send_buffer.read().unwrap();
+                let buffer = self.send_buffer.read().await;
                 let should_flush = buffer.len() > 0;
                 if !should_flush {
                     continue;
                 }
             }
-            self.flush_send_buffer();
+            self.flush_send_buffer().await;
         }
     }
 
     pub async fn start_check_bytes_read(&self) {
         loop {
             sleep(Duration::from_millis(self.config.check_timeout_interval));
-            let sent_time = self.bytes_read_sent_time.read().unwrap();
-            let update_time = self.bytes_read_update_time.read().unwrap();
-            let bytes_read = self.bytes_read.read().unwrap();
+            let sent_time = self.bytes_read_sent_time.read().await;
+            let update_time = self.bytes_read_update_time.read().await;
+            let bytes_read = self.bytes_read.read().await;
 
             let wait = SystemTime::now()
                 .sub(Duration::from_millis(
@@ -315,26 +314,26 @@ impl Session {
                     conn.local_client_id.clone(),
                     conn.remote_client_id.clone(),
                     &buf,
-                    Duration::from_millis(conn.retransmission_timeout().as_millis() as u64),
+                    Duration::from_millis(conn.retransmission_timeout().await.as_millis() as u64),
                 );
                 success = true;
             }
             if success {
-                self.update_bytes_read_sent_time();
+                self.update_bytes_read_sent_time().await;
             }
         }
     }
 
-    pub fn wait_for_send_window(&self, n: u32) -> u32 {
+    pub async fn wait_for_send_window(&self, n: u32) -> u32 {
         let ticker = tick(Duration::from_millis(100));
         let (_, rx) = self.send_window_update.clone();
-        while self.send_window_used() + n > self.send_window_size {
+        while self.send_window_used().await + n > self.send_window_size {
             select! {
                 recv(rx) -> _ => {},
                 recv(ticker) -> _ => {},
             }
         }
-        self.send_window_size - self.send_window_used()
+        self.send_window_size - self.send_window_used().await
     }
 
     pub async fn send_handshake_packet(&self, write_timeout: Duration) {
@@ -393,8 +392,8 @@ impl Session {
         }
     }
 
-    pub fn handle_handshake_packet(&mut self, packet: Packet) {
-        if self.is_established() {
+    pub async fn handle_handshake_packet(&mut self, packet: Packet) {
+        if self.is_established().await {
             return;
         }
 
@@ -436,17 +435,17 @@ impl Session {
             let conn = Connection::new(local_client_id, remote_client_id, initial_window_size);
             connections.insert(key, conn);
         }
-        self.connections = Arc::new(AsyncRwlock::new(connections));
+        self.connections = Arc::new(RwLock::new(connections));
 
         self.remote_client_ids = packet.client_ids.clone();
-        *self.is_established.write().unwrap() = true;
+        *self.is_established.write().await = true;
 
         let (tx, _) = self.on_accept.clone();
         tx.send(()).expect("send on_accept error");
     }
 
     pub async fn send_close_packet(&self) {
-        if !self.is_established() {
+        if !self.is_established().await {
             println!("send_close_packet: session is not established");
             return;
         }
@@ -461,11 +460,11 @@ impl Session {
         let connections = self.connections.clone();
         let mut tasks = vec![];
         for (_, conn) in connections.read().await.iter() {
-            let send_with = self.send_with.clone();
+            let send_with = self.send_with;
             let local_client_id = conn.local_client_id.clone();
             let remote_client_id = conn.remote_client_id.clone();
             let buf = buf.clone();
-            let timeout = conn.retransmission_timeout();
+            let timeout = conn.retransmission_timeout().await;
             let h =
                 spawn(async move { (send_with)(local_client_id, remote_client_id, &buf, timeout) });
             tasks.push(h);
@@ -479,17 +478,17 @@ impl Session {
         }
     }
 
-    pub fn handle_close_packet(&self) {
-        if !self.is_established() {
+    pub async fn handle_close_packet(&self) {
+        if !self.is_established().await {
             println!("handle_close_packet: session is not established");
             return;
         }
 
-        *self.is_closed.write().unwrap() = true;
+        *self.is_closed.write().await = true;
     }
 
     pub async fn dial(&self) {
-        let mut accept = self.is_accepted.write().unwrap();
+        let mut accept = self.is_accepted.write().await;
         if *accept {
             println!("dial: session is already accepted");
             return;
@@ -506,7 +505,7 @@ impl Session {
     }
 
     pub async fn accept(&self) {
-        let mut accept = self.is_accepted.write().unwrap();
+        let mut accept = self.is_accepted.write().await;
         if *accept {
             println!("accept: session is already accepted");
             return;
@@ -523,12 +522,12 @@ impl Session {
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> usize {
-        if self.is_closed() {
+        if self.is_closed().await {
             println!("read: session is closed");
             return 0;
         }
 
-        if !self.is_established() {
+        if !self.is_established().await {
             println!("read: session is not established");
             return 0;
         }
@@ -538,10 +537,10 @@ impl Session {
             return 0;
         }
 
-        let mut recv_window_data = self.recv_window_data.write().unwrap();
+        let mut recv_window_data = self.recv_window_data.write().await;
         let mut bytes_received = 0;
         loop {
-            let mut recv_window_start_seq = self.recv_window_start_seq.write().unwrap();
+            let mut recv_window_start_seq = self.recv_window_start_seq.write().await;
             if recv_window_data.contains_key(&recv_window_start_seq) {
                 break;
             }
@@ -571,9 +570,9 @@ impl Session {
                 recv_window_data.remove(&recv_window_start_seq);
                 *recv_window_start_seq = next_seq(*recv_window_start_seq, 1);
             }
-            *self.recv_window_used.write().unwrap() -= bytes_received as u32;
-            *self.bytes_read.write().unwrap() += bytes_received as u64;
-            *self.bytes_read_update_time.write().unwrap() = SystemTime::now();
+            *self.recv_window_used.write().await -= bytes_received as u32;
+            *self.bytes_read.write().await += bytes_received as u64;
+            *self.bytes_read_update_time.write().await = SystemTime::now();
 
             if self.is_stream() {
                 while bytes_received < buf.len() {
@@ -585,11 +584,11 @@ impl Session {
     }
 
     pub async fn write(&self, buf: &mut [u8]) -> usize {
-        if self.is_closed() {
+        if self.is_closed().await {
             println!("write: session is closed");
             return 0;
         }
-        if self.is_established() {
+        if self.is_established().await {
             println!("write: session is not established");
             return 0;
         }
@@ -610,33 +609,41 @@ impl Session {
         if self.is_stream() {
             //todo
         } else {
-            self.wait_for_send_window(buf.len() as u32);
-            let mut send_buffer = self.send_buffer.write().unwrap();
+            self.wait_for_send_window(buf.len() as u32).await;
+            let mut send_buffer = self.send_buffer.write().await;
             *send_buffer = send_buffer[..buf.len()].to_owned();
-            *self.bytes_write.write().unwrap() += buf.len() as u64;
+            *self.bytes_write.write().await += buf.len() as u64;
             bytes_send += buf.len();
 
-            self.flush_send_buffer();
+            self.flush_send_buffer().await;
         }
         bytes_send
     }
 }
 
-async fn start(session: Arc<AsyncMutex<Session>>) {
+async fn start(session: Arc<Mutex<Session>>) {
     let session_clone = session.clone();
     let session_clone2 = session.clone();
+    let mut tasks = vec![];
 
-    let sess1 = session_clone.lock().await;
-    let sess2 = session_clone2.lock().await;
-    let aa = join(sess1.start_check_bytes_read(), sess2.start_flush());
-    aa.await;
+    let flush = async move {
+        let sess = session_clone.lock().await;
+        sess.start_flush().await;
+    };
+
+    let check = async move {
+        let sess = session_clone2.lock().await;
+        sess.start_check_bytes_read().await;
+    };
+    tasks.push(spawn(flush));
+    tasks.push(spawn(check));
 
     let sess = session.lock().await;
     for conn in sess.connections.read().await.values() {
         let conn = Arc::new(Mutex::new(conn.clone()));
         let sess_clone = session.clone();
         let config_clone = sess.config.clone();
-        start_conn(
+        tasks.push(spawn(start_conn(
             conn.clone(),
             sess_clone,
             config_clone,
@@ -644,7 +651,7 @@ async fn start(session: Arc<AsyncMutex<Session>>) {
             sess.send_chan.1.clone(),
             sess.resend_chan.1.clone(),
             sess.resend_chan.0.clone(),
-        )
-        .await;
+        )));
     }
+    join_all(tasks).await;
 }

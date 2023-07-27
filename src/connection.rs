@@ -1,19 +1,16 @@
 use crate::session::{NcpConfig, Session};
 use crossbeam_channel::{after, select, Receiver, Sender};
 use std::collections::{BinaryHeap, HashMap};
-use std::io::Read;
-use std::mem::replace;
 
 use crate::pb::packet::Packet;
 use crate::utils::{next_seq, SeqElem, SeqHeap};
 use futures_util::join;
 use prost::Message;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
-use tokio::spawn;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::RwLock as AsyncRwlock;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -46,27 +43,27 @@ impl Connection {
         }
     }
 
-    pub fn send_window_used(&self) -> u32 {
-        self.time_sent_seq.read().unwrap().len() as u32
+    pub async fn send_window_used(&self) -> u32 {
+        self.time_sent_seq.read().await.len() as u32
     }
 
-    pub fn retransmission_timeout(&self) -> Duration {
-        *self.retransmission_timeout.read().unwrap()
+    pub async fn retransmission_timeout(&self) -> Duration {
+        *self.retransmission_timeout.read().await
     }
 
-    pub fn send_ack(&self, seq: u32) {
+    pub async fn send_ack(&self, seq: u32) {
         let seq = SeqElem::new(seq);
-        self.send_ack_queue.write().unwrap().push(seq);
+        self.send_ack_queue.write().await.push(seq);
     }
 
-    pub fn send_ack_queue_len(&self) -> usize {
-        self.send_ack_queue.read().unwrap().len()
+    pub async fn send_ack_queue_len(&self) -> usize {
+        self.send_ack_queue.read().await.len()
     }
 
-    pub fn wait_for_send_window(&self) -> Result<(), String> {
+    pub async fn wait_for_send_window(&self) -> Result<(), String> {
         let send_window_update_rx_clone = self.send_window_update_rx.clone();
         let timeout = after(Duration::from_secs(1));
-        while self.send_window_used() >= self.window_size as u32 {
+        while self.send_window_used().await >= self.window_size as u32 {
             select! {
                 recv(send_window_update_rx_clone) -> _ => {}
                 recv(timeout) -> _ => {
@@ -78,11 +75,11 @@ impl Connection {
         Ok(())
     }
 
-    pub fn receive_ack(&mut self, sequence_id: u32, is_sent_by_me: bool) {
-        let time_sent_seq = self.time_sent_seq.read().unwrap();
+    pub async fn receive_ack(&mut self, sequence_id: u32, is_sent_by_me: bool) {
+        let time_sent_seq = self.time_sent_seq.read().await;
         let t = time_sent_seq.get(&sequence_id).unwrap();
 
-        let resent_seq = self.resent_seq.read().unwrap();
+        let resent_seq = self.resent_seq.read().await;
         match resent_seq.get(&sequence_id) {
             Some(_) => {}
             None => {
@@ -93,20 +90,20 @@ impl Connection {
 
         if is_sent_by_me {
             let rtt = SystemTime::now().duration_since(*t).unwrap();
-            let timeout = self.retransmission_timeout();
+            let timeout = self.retransmission_timeout().await;
             let d = (3 * rtt - timeout).as_nanos() as f64
                 / (Duration::from_millis(1000)).as_nanos() as f64
                 * Duration::from_millis(100).as_nanos() as f64;
             let ms = Duration::from_nanos(d.tanh() as u64);
-            *self.retransmission_timeout.write().unwrap() = ms;
+            *self.retransmission_timeout.write().await = ms;
             if ms.as_millis() > self.config.max_retransmission_timeout as u128 {
-                *self.retransmission_timeout.write().unwrap() =
-                    Duration::from_millis(self.config.max_retransmission_timeout as u64);
+                *self.retransmission_timeout.write().await =
+                    Duration::from_millis(self.config.max_retransmission_timeout);
             }
         }
 
-        self.time_sent_seq.write().unwrap().remove(&sequence_id);
-        self.resent_seq.write().unwrap().remove(&sequence_id);
+        self.time_sent_seq.write().await.remove(&sequence_id);
+        self.resent_seq.write().await.remove(&sequence_id);
 
         self.send_window_update_tx
             .send_timeout((), Duration::from_secs(0))
@@ -123,7 +120,7 @@ impl Connection {
 
 pub async fn start_conn(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<AsyncMutex<Session>>,
+    session: Arc<Mutex<Session>>,
     config: NcpConfig,
     send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
@@ -145,12 +142,12 @@ pub async fn start_conn(
 
 async fn tx(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<AsyncMutex<Session>>,
+    session: Arc<Mutex<Session>>,
     send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
     resend_rx: Receiver<u32>,
 ) {
-    let mut conn = conn.lock().unwrap();
+    let mut conn = conn.lock().await;
     let mut seq = 0;
     loop {
         if seq == 0 {
@@ -160,7 +157,7 @@ async fn tx(
             }
         }
         if seq == 0 {
-            let res = conn.wait_for_send_window();
+            let res = conn.wait_for_send_window().await;
             if res.is_err() {
                 return;
             }
@@ -170,11 +167,11 @@ async fn tx(
             }
         }
 
-        let send_window_data = send_window_data.read().unwrap();
+        let send_window_data = send_window_data.read().await;
         let buf = send_window_data.get(&seq).unwrap();
         if buf.is_empty() {
-            let mut time_sent_seq = conn.time_sent_seq.write().unwrap();
-            let mut resent_seq = conn.resent_seq.write().unwrap();
+            let mut time_sent_seq = conn.time_sent_seq.write().await;
+            let mut resent_seq = conn.resent_seq.write().await;
             time_sent_seq.remove(&seq);
             resent_seq.remove(&seq);
             seq = 0;
@@ -203,8 +200,8 @@ async fn tx(
         }
 
         {
-            let mut tss = conn.time_sent_seq.write().unwrap();
-            let mut resent_seq = conn.resent_seq.write().unwrap();
+            let mut tss = conn.time_sent_seq.write().await;
+            let mut resent_seq = conn.resent_seq.write().await;
 
             match tss.get(&seq) {
                 None => {
@@ -219,16 +216,12 @@ async fn tx(
     }
 }
 
-async fn send_ack(
-    conn: Arc<Mutex<Connection>>,
-    session: Arc<AsyncMutex<Session>>,
-    config: NcpConfig,
-) {
+async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, config: NcpConfig) {
     loop {
         sleep(Duration::from_secs(config.send_ack_interval));
         {
-            let c = conn.lock().unwrap();
-            if c.send_ack_queue_len() == 0 {
+            let c = conn.lock().await;
+            if c.send_ack_queue_len().await == 0 {
                 continue;
             }
         }
@@ -237,15 +230,15 @@ async fn send_ack(
         let mut ack_seq_count_list: Vec<u32> = Vec::new();
 
         {
-            let c = conn.lock().unwrap();
+            let c = conn.lock().await;
             loop {
-                if c.send_ack_queue_len() == 0
+                if c.send_ack_queue_len().await == 0
                     && ack_start_seq_list.len() >= config.max_ask_seq_list_size
                 {
                     break;
                 }
 
-                let mut send_ack_queue = c.send_ack_queue.write().unwrap();
+                let mut send_ack_queue = c.send_ack_queue.write().await;
                 let ack_start_seq = send_ack_queue.pop().unwrap();
                 let mut ack_seq_count: u32 = 1;
                 while send_ack_queue.len() > 0
@@ -283,8 +276,8 @@ async fn send_ack(
         let sess = session.lock().await;
         let send_with = sess.send_with;
         let res = send_with(
-            conn.lock().unwrap().local_client_id.clone(),
-            conn.lock().unwrap().remote_client_id.clone(),
+            conn.lock().await.local_client_id.clone(),
+            conn.lock().await.remote_client_id.clone(),
             &buf,
             Duration::from_secs(0), //todo
         );
@@ -296,7 +289,7 @@ async fn send_ack(
 
 async fn check_timeout(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<AsyncMutex<Session>>,
+    session: Arc<Mutex<Session>>,
     resend_tx: Sender<u32>,
 ) {
     let sess = session.lock().await;
@@ -306,11 +299,11 @@ async fn check_timeout(
     loop {
         sleep(Duration::from_secs(config.check_timeout_interval));
 
-        let conn = conn.lock().unwrap();
-        let threshold = SystemTime::now() - conn.retransmission_timeout();
+        let conn = conn.lock().await;
+        let threshold = SystemTime::now() - conn.retransmission_timeout().await;
 
-        let tss = conn.time_sent_seq.read().unwrap();
-        let mut rss = conn.resent_seq.write().unwrap();
+        let tss = conn.time_sent_seq.read().await;
+        let mut rss = conn.resent_seq.write().await;
         for (seq, t) in tss.iter() {
             if rss.contains_key(seq) {
                 continue;
