@@ -1,6 +1,7 @@
 use crate::session::{NcpConfig, Session};
 use crossbeam_channel::{after, select, Receiver, Sender};
 use std::collections::{BinaryHeap, HashMap};
+use std::io::Read;
 use std::mem::replace;
 
 use crate::pb::packet::Packet;
@@ -10,6 +11,9 @@ use prost::Message;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
+use tokio::spawn;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as AsyncRwlock;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -119,7 +123,7 @@ impl Connection {
 
 pub async fn start_conn(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<Mutex<Session>>,
+    session: Arc<AsyncMutex<Session>>,
     config: NcpConfig,
     send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
@@ -141,7 +145,7 @@ pub async fn start_conn(
 
 async fn tx(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<Mutex<Session>>,
+    session: Arc<AsyncMutex<Session>>,
     send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     send_rx: Receiver<u32>,
     resend_rx: Receiver<u32>,
@@ -168,7 +172,7 @@ async fn tx(
 
         let send_window_data = send_window_data.read().unwrap();
         let buf = send_window_data.get(&seq).unwrap();
-        if buf.len() == 0 {
+        if buf.is_empty() {
             let mut time_sent_seq = conn.time_sent_seq.write().unwrap();
             let mut resent_seq = conn.resent_seq.write().unwrap();
             time_sent_seq.remove(&seq);
@@ -178,7 +182,7 @@ async fn tx(
         }
 
         {
-            let session = session.lock().unwrap();
+            let session = session.lock().await;
             let send_with = session.send_with;
             let res = send_with(
                 conn.local_client_id.clone(),
@@ -202,7 +206,7 @@ async fn tx(
             let mut tss = conn.time_sent_seq.write().unwrap();
             let mut resent_seq = conn.resent_seq.write().unwrap();
 
-            let _ = match tss.get(&seq) {
+            match tss.get(&seq) {
                 None => {
                     tss.insert(seq, SystemTime::now());
                 }
@@ -215,7 +219,11 @@ async fn tx(
     }
 }
 
-async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, config: NcpConfig) {
+async fn send_ack(
+    conn: Arc<Mutex<Connection>>,
+    session: Arc<AsyncMutex<Session>>,
+    config: NcpConfig,
+) {
     loop {
         sleep(Duration::from_secs(config.send_ack_interval));
         {
@@ -229,7 +237,7 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
         let mut ack_seq_count_list: Vec<u32> = Vec::new();
 
         {
-            let mut c = conn.lock().unwrap();
+            let c = conn.lock().unwrap();
             loop {
                 if c.send_ack_queue_len() == 0
                     && ack_start_seq_list.len() >= config.max_ask_seq_list_size
@@ -272,7 +280,7 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
         let mut buf = Vec::new();
         p.encode(&mut buf).unwrap();
 
-        let sess = session.lock().unwrap();
+        let sess = session.lock().await;
         let send_with = sess.send_with;
         let res = send_with(
             conn.lock().unwrap().local_client_id.clone(),
@@ -280,10 +288,7 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
             &buf,
             Duration::from_secs(0), //todo
         );
-        match res {
-            Ok(_) => {}
-            Err(_) => {}
-        }
+        if res.is_ok() {}
 
         // sess.update_bytes_read_sent_time
     }
@@ -291,10 +296,10 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
 
 async fn check_timeout(
     conn: Arc<Mutex<Connection>>,
-    session: Arc<Mutex<Session>>,
+    session: Arc<AsyncMutex<Session>>,
     resend_tx: Sender<u32>,
 ) {
-    let sess = session.lock().unwrap();
+    let sess = session.lock().await;
     let config = sess.config.clone();
     drop(sess);
     let mut new_resend = false;

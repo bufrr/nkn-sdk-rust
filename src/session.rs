@@ -1,11 +1,9 @@
 use crate::connection::{start_conn, Connection};
 use crate::pb::packet::Packet;
 use crate::utils::{conn_key, next_seq, Channel};
-use crossbeam_channel::{bounded, select, tick, unbounded, Receiver, Sender};
-use futures::future::join_all;
+use crossbeam_channel::{bounded, select, tick};
 use futures::pin_mut;
-use futures_util::future::{select_all, select_ok};
-use futures_util::stream::FuturesUnordered;
+use futures_util::future::{join, select_ok};
 use prost::Message;
 use std::collections::HashMap;
 use std::ops::Sub;
@@ -13,9 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use tokio::net::unix::SocketAddr;
-use tokio::spawn;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock as AsyncRwlock;
+use tokio::{join, spawn};
 
 type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
 
@@ -272,7 +270,7 @@ impl Session {
         tx.send(*seq).unwrap();
     }
 
-    pub fn start_flush(&self) {
+    pub async fn start_flush(&self) {
         loop {
             sleep(Duration::from_millis(self.config.flush_interval as u64));
             {
@@ -622,24 +620,31 @@ impl Session {
         }
         bytes_send
     }
-
-    pub fn start(&self) {
-        //todo
-    }
 }
 
 async fn start(session: Arc<AsyncMutex<Session>>) {
-    let mut sess = session.lock().await;
+    let session_clone = session.clone();
+    let session_clone2 = session.clone();
+
+    let sess1 = session_clone.lock().await;
+    let sess2 = session_clone2.lock().await;
+    let aa = join(sess1.start_check_bytes_read(), sess2.start_flush());
+    aa.await;
+
+    let sess = session.lock().await;
     for conn in sess.connections.read().await.values() {
         let conn = Arc::new(Mutex::new(conn.clone()));
-        // start_conn(
-        //     conn.clone(),
-        //
-        //     sess.config.clone(),
-        //     sess.send_window_data.clone(),
-        //     sess.send_chan.1.clone(),
-        //     sess.resend_chan.1.clone(),
-        //     sess.resend_chan.0.clone(),
-        // ).await;
+        let sess_clone = session.clone();
+        let config_clone = sess.config.clone();
+        start_conn(
+            conn.clone(),
+            sess_clone,
+            config_clone,
+            sess.send_window_data.clone(),
+            sess.send_chan.1.clone(),
+            sess.resend_chan.1.clone(),
+            sess.resend_chan.0.clone(),
+        )
+        .await;
     }
 }
