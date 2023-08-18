@@ -9,12 +9,11 @@ use std::ops::Sub;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
-use tokio::net::unix::SocketAddr;
 use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
-type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
+pub type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
 
 pub const MIN_SEQUENCE_ID: u32 = 1;
 
@@ -56,8 +55,8 @@ impl Default for NcpConfig {
 #[derive(Debug)]
 pub struct Session {
     pub config: NcpConfig,
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
+    local_addr: String,
+    remote_addr: String,
     local_client_ids: Vec<String>,
     remote_client_ids: Vec<String>,
 
@@ -96,8 +95,8 @@ pub struct Session {
 impl Session {
     pub fn new(
         config: NcpConfig,
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
+        local_addr: String,
+        remote_addr: String,
         local_client_ids: Vec<String>,
         remote_client_ids: Vec<String>,
         send_with: SendWith,
@@ -367,7 +366,7 @@ impl Session {
             for (i, id) in local_client_ids.iter().enumerate() {
                 let local_client_id = id.clone();
                 let mut remote_client_id = id.clone();
-                if remote_client_ids.len() > 0 {
+                if !remote_client_ids.is_empty() {
                     remote_client_id = remote_client_ids[i].clone();
                 }
                 let send_with = self.send_with;
