@@ -1,19 +1,21 @@
 use crate::connection::{start_conn, Connection};
 use crate::pb::packet::Packet;
-use crate::utils::{conn_key, next_seq, Channel};
+use crate::utils::{compare_seq, conn_key, next_seq, seq_in_between, Channel};
 use crossbeam_channel::{bounded, select, tick};
 use futures_util::future::{join_all, select_ok};
 use prost::Message;
 use std::collections::HashMap;
-use std::ops::Sub;
+use std::future::Future;
+use std::io::Error;
+use std::ops::{Deref, Sub};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
-use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
-pub type SendWith = fn(String, String, &Vec<u8>, Duration) -> Result<(), String>;
+pub type SendWith = Box<dyn FnMut(String, String, &[u8], Duration) -> Result<usize, Error>>;
 
 pub const MIN_SEQUENCE_ID: u32 = 1;
 
@@ -52,7 +54,6 @@ impl Default for NcpConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct Session {
     pub config: NcpConfig,
     local_addr: String,
@@ -65,16 +66,16 @@ pub struct Session {
     recv_window_size: u32,
     send_mtu: u32,
     recv_mtu: u32,
-    connections: Arc<RwLock<HashMap<String, Connection>>>,
+    pub connections: Arc<RwLock<HashMap<String, Connection>>>,
 
     is_accepted: Arc<RwLock<bool>>,
     is_established: Arc<RwLock<bool>>,
     is_closed: Arc<RwLock<bool>>,
 
     send_buffer: Arc<RwLock<Vec<u8>>>,
-    send_window_start_seq: Arc<RwLock<u32>>,
-    send_window_end_seq: Arc<RwLock<u32>>,
-    send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+    pub send_window_start_seq: Arc<RwLock<u32>>,
+    pub send_window_end_seq: Arc<RwLock<u32>>,
+    pub send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
     recv_window_start_seq: Arc<RwLock<u32>>,
     recv_window_used: Arc<RwLock<u32>>,
     recv_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
@@ -282,7 +283,7 @@ impl Session {
         }
     }
 
-    pub async fn start_check_bytes_read(&self) {
+    pub async fn start_check_bytes_read(&mut self) {
         loop {
             sleep(Duration::from_millis(self.config.check_timeout_interval));
             let sent_time = self.bytes_read_sent_time.read().await;
@@ -308,11 +309,12 @@ impl Session {
 
             let mut success = false;
             let connections = self.connections.read().await;
+            let send_with = self.send_with.as_mut();
             for (_, conn) in connections.iter() {
-                let res = (self.send_with)(
+                let res = (send_with)(
                     conn.local_client_id.clone(),
                     conn.remote_client_id.clone(),
-                    &buf,
+                    &mut buf,
                     Duration::from_millis(conn.retransmission_timeout().await.as_millis() as u64),
                 );
                 success = true;
@@ -335,7 +337,7 @@ impl Session {
         self.send_window_size - self.send_window_used().await
     }
 
-    pub async fn send_handshake_packet(&self, write_timeout: Duration) {
+    pub async fn send_handshake_packet(&mut self, write_timeout: Duration) {
         let p = Packet {
             client_ids: self.local_client_ids.clone(),
             window_size: self.recv_window_size,
@@ -346,20 +348,17 @@ impl Session {
         let mut buf = Vec::new();
         p.encode(&mut buf).unwrap();
 
-        let mut tasks = vec![];
+        //let mut tasks: Vec<Pin<Box<dyn Future<Output = Result<usize, Error>>>>> = vec![];
 
         let connections = self.connections.read().await;
         if !connections.is_empty() {
-            for (_, conn) in connections.iter() {
-                let send_with = self.send_with;
-                let local_client_id = conn.local_client_id.clone();
-                let remote_client_id = conn.remote_client_id.clone();
-                let buf = buf.clone();
-                let h = spawn(async move {
-                    (send_with)(local_client_id, remote_client_id, &buf, write_timeout)
-                });
-                tasks.push(h);
-            }
+            let (_, conn) = connections.iter().next().unwrap();
+            let local_client_id = conn.local_client_id.clone();
+            let remote_client_id = conn.remote_client_id.clone();
+            let mut buf = buf.clone();
+            let send_with = self.send_with.as_mut();
+            (send_with)(local_client_id, remote_client_id, &mut buf, write_timeout)
+                .expect("TODO: panic message");
         } else {
             let local_client_ids = self.local_client_ids.clone();
             let remote_client_ids = self.remote_client_ids.clone();
@@ -369,24 +368,11 @@ impl Session {
                 if !remote_client_ids.is_empty() {
                     remote_client_id = remote_client_ids[i].clone();
                 }
-                let send_with = self.send_with;
-                let buf = buf.clone();
-                let h = spawn(async move {
-                    (send_with)(
-                        local_client_id,
-                        remote_client_id,
-                        &buf.clone(),
-                        write_timeout,
-                    )
-                });
-                tasks.push(h);
-            }
-        }
-        let res = select_ok(tasks).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                println!("send_handshake_packet error: {}", e);
+                let send_with = self.send_with.as_mut();
+                let mut buf = buf.clone();
+                (send_with)(local_client_id, remote_client_id, &mut buf, write_timeout)
+                    .expect("TODO: panic message");
+                //tasks.push(Box::pin(h));
             }
         }
     }
@@ -443,7 +429,7 @@ impl Session {
         tx.send(()).expect("send on_accept error");
     }
 
-    pub async fn send_close_packet(&self) {
+    pub async fn send_close_packet(&mut self) {
         if !self.is_established().await {
             println!("send_close_packet: session is not established");
             return;
@@ -456,18 +442,18 @@ impl Session {
         let mut buf = Vec::new();
         p.encode(&mut buf).unwrap();
 
-        let connections = self.connections.clone();
-        let mut tasks = vec![];
-        for (_, conn) in connections.read().await.iter() {
-            let send_with = self.send_with;
-            let local_client_id = conn.local_client_id.clone();
-            let remote_client_id = conn.remote_client_id.clone();
-            let buf = buf.clone();
-            let timeout = conn.retransmission_timeout().await;
-            let h =
-                spawn(async move { (send_with)(local_client_id, remote_client_id, &buf, timeout) });
-            tasks.push(h);
-        }
+        let connections = self.connections.read().await;
+        let tasks: Vec<Pin<Box<dyn Future<Output = Result<usize, Error>>>>> = vec![];
+        let (_, conn) = connections.iter().next().unwrap();
+
+        let send_with = self.send_with.as_mut();
+        let local_client_id = conn.local_client_id.clone();
+        let remote_client_id = conn.remote_client_id.clone();
+        let mut buf = buf.clone();
+        let timeout = conn.retransmission_timeout().await;
+        (send_with)(local_client_id, remote_client_id, &mut buf, timeout)
+            .expect("TODO: panic message");
+
         let res = select_ok(tasks).await;
         match res {
             Ok(_) => {}
@@ -486,38 +472,30 @@ impl Session {
         *self.is_closed.write().await = true;
     }
 
-    pub async fn dial(&self) {
-        let mut accept = self.is_accepted.write().await;
-        if *accept {
-            println!("dial: session is already accepted");
-            return;
+    pub async fn dial(&mut self) {
+        {
+            let mut accept = self.is_accepted.write().await;
+            if *accept {
+                println!("dial: session is already accepted");
+                return;
+            }
+            *accept = true;
         }
-
         let timeout = Duration::from_millis(self.config.initial_retransmission_timeout);
         self.send_handshake_packet(timeout).await;
-
-        //let mut sess = self.clone();
-
-        //start(Arc::new(AsyncMutex::new(*sess)));
-
-        *accept = true;
     }
 
-    pub async fn accept(&self) {
-        let mut accept = self.is_accepted.write().await;
-        if *accept {
-            println!("accept: session is already accepted");
-            return;
+    pub async fn accept(&mut self) {
+        {
+            let mut accept = self.is_accepted.write().await;
+            if *accept {
+                println!("accept: session is already accepted");
+                return;
+            }
+            *accept = true;
         }
-
         let timeout = Duration::from_millis(self.config.max_retransmission_timeout);
         self.send_handshake_packet(timeout).await;
-
-        //let mut sess = self.clone();
-
-        //start(Arc::new(AsyncMutex::new(*sess)));
-
-        *accept = true;
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> usize {
@@ -618,12 +596,27 @@ impl Session {
         }
         bytes_send
     }
+
+    pub async fn update_conn_window_size(&self) {
+        let mut total_size = 0.0;
+        let mut connections = self.connections.write().await;
+        for (_, conn) in connections.iter() {
+            total_size += conn.window_size;
+        }
+        if total_size <= 0.0 {
+            return;
+        }
+        for (_, conn) in connections.iter_mut() {
+            let n = self.send_window_packet_count * (conn.window_size / total_size);
+            conn.set_window_size(n, 1.0);
+        }
+    }
 }
 
 async fn start(session: Arc<Mutex<Session>>) {
     let session_clone = session.clone();
     let session_clone2 = session.clone();
-    let mut tasks = vec![];
+    let mut tasks: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![];
 
     let flush = async move {
         let sess = session_clone.lock().await;
@@ -631,18 +624,20 @@ async fn start(session: Arc<Mutex<Session>>) {
     };
 
     let check = async move {
-        let sess = session_clone2.lock().await;
+        let mut sess = session_clone2.lock().await;
         sess.start_check_bytes_read().await;
     };
-    tasks.push(spawn(flush));
-    tasks.push(spawn(check));
+    tasks.push(Box::pin(flush));
+    tasks.push(Box::pin(check));
 
     let sess = session.lock().await;
+
+    //let mut conn_tasks = vec![];
     for conn in sess.connections.read().await.values() {
         let conn = Arc::new(Mutex::new(conn.clone()));
-        let sess_clone = session.clone();
         let config_clone = sess.config.clone();
-        tasks.push(spawn(start_conn(
+        let sess_clone = session.clone();
+        let h = start_conn(
             conn.clone(),
             sess_clone,
             config_clone,
@@ -650,7 +645,150 @@ async fn start(session: Arc<Mutex<Session>>) {
             sess.send_chan.1.clone(),
             sess.resend_chan.1.clone(),
             sess.resend_chan.0.clone(),
-        )));
+        );
+        tasks.push(Box::pin(h));
     }
     join_all(tasks).await;
+}
+
+pub async fn receive_with(
+    session: Arc<Mutex<Session>>,
+    local_client_id: String,
+    remote_client_id: String,
+    buf: &[u8],
+    timeout: Duration,
+) {
+    let mut sess = session.lock().await;
+    let p = Packet::decode(buf).unwrap();
+    if p.close {
+        sess.handle_close_packet().await;
+        return;
+    }
+
+    let is_established = session.lock().await.is_established().await;
+    if !is_established && p.handshake {
+        let mut sess = session.lock().await;
+        sess.handle_handshake_packet(p.clone()).await;
+    }
+
+    if is_established && (!p.ack_start_seq.is_empty() || !p.ack_seq_count.is_empty()) {
+        if p.ack_start_seq.len() != p.ack_seq_count.len()
+            && !p.ack_start_seq.is_empty()
+            && !p.ack_seq_count.is_empty()
+        {
+            println!("receive_with: ack_start_seq and ack_seq_count length not equal");
+            return;
+        }
+
+        let mut count = 0;
+        if !p.ack_seq_count.is_empty() {
+            count = p.ack_start_seq.len();
+        } else {
+            count = p.ack_seq_count.len();
+        }
+
+        let mut ack_start_seq: u32 = 0;
+        let mut ack_end_seq: u32 = 0;
+
+        for i in 0..count {
+            if !p.ack_start_seq.is_empty() {
+                ack_start_seq = p.ack_start_seq[i];
+            } else {
+                ack_start_seq = MIN_SEQUENCE_ID;
+            }
+
+            if !p.ack_seq_count.is_empty() {
+                ack_end_seq = next_seq(ack_start_seq, p.ack_seq_count[i] as i64);
+            } else {
+                ack_end_seq = next_seq(ack_start_seq, 1);
+            }
+
+            let mut send_window_start_seq = sess.send_window_start_seq.write().await;
+            let mut send_window_end_seq = sess.send_window_end_seq.read().await;
+            if seq_in_between(
+                *send_window_start_seq,
+                *send_window_end_seq,
+                next_seq(ack_end_seq, -1),
+            ) {
+                if !seq_in_between(*send_window_start_seq, *send_window_end_seq, ack_start_seq) {
+                    ack_start_seq = *send_window_start_seq;
+                }
+
+                let mut seq = ack_start_seq;
+                while seq_in_between(ack_start_seq, ack_end_seq, seq) {
+                    let mut connections = sess.connections.write().await;
+                    for (key, conn) in connections.iter_mut() {
+                        let is_sent_by_me = key
+                            == &conn_key(
+                                conn.local_client_id.clone(),
+                                conn.remote_client_id.clone(),
+                            );
+                        conn.receive_ack(seq, is_sent_by_me).await;
+                    }
+                    sess.send_window_data.write().await.remove(&seq);
+                    seq = next_seq(seq, 1);
+                }
+                if ack_start_seq == *send_window_start_seq {
+                    loop {
+                        *send_window_start_seq = next_seq(*send_window_start_seq, 1);
+                        if !sess
+                            .send_window_data
+                            .read()
+                            .await
+                            .contains_key(send_window_start_seq.deref())
+                        {
+                            break;
+                        }
+                        if *send_window_start_seq == *send_window_end_seq {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        sess.update_conn_window_size().await;
+    }
+    if is_established && p.bytes_read > *sess.remote_bytes_read.read().await {
+        *sess.remote_bytes_read.write().await = p.bytes_read;
+        sess.send_window_update.0.send(()).unwrap();
+    }
+
+    if is_established && p.sequence_id > 0 {
+        if p.data.len() > sess.recv_mtu as usize {
+            return println!("receive_with: data is too large");
+        }
+        if compare_seq(p.sequence_id, *sess.recv_window_start_seq.read().await) >= 0
+            && sess
+                .recv_window_data
+                .write()
+                .await
+                .contains_key(&p.sequence_id)
+        {
+            if *sess.recv_window_used.read().await + p.data.len() as u32 > sess.recv_window_size {
+                return println!("receive_with: recv_window is full");
+            }
+            sess.recv_window_data
+                .write()
+                .await
+                .insert(p.sequence_id, p.data.clone());
+            *sess.recv_window_used.write().await += p.data.len() as u32;
+
+            if p.sequence_id == *sess.recv_window_start_seq.read().await {
+                select! {
+                   recv(sess.recv_data_update.1) -> _ => {},
+                    default(Duration::from_millis(0)) => {},
+                }
+            }
+        }
+        if let Some(conn) = sess
+            .connections
+            .write()
+            .await
+            .get_mut(conn_key(local_client_id, remote_client_id).as_str())
+        {
+            conn.send_ack(p.sequence_id).await;
+        } else {
+            println!("receive_with: connection not found");
+        }
+    }
 }

@@ -96,7 +96,7 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     config: ClientConfig,
     wallet: Arc<Mutex<Wallet>>,

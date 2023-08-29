@@ -177,14 +177,14 @@ async fn tx(
             seq = 0;
             continue;
         }
-
+        let mut buf_clone = buf.clone();
         {
-            let session = session.lock().await;
-            let send_with = session.send_with;
+            let mut session = session.lock().await;
+            let send_with = session.send_with.as_mut();
             let res = send_with(
                 conn.local_client_id.clone(),
                 conn.local_client_id.clone(),
-                buf,
+                &mut buf_clone,
                 Duration::from_secs(0),
             );
             match res {
@@ -272,13 +272,13 @@ async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, co
         };
         let mut buf = Vec::new();
         p.encode(&mut buf).unwrap();
-
-        let sess = session.lock().await;
-        let send_with = sess.send_with;
+        let mut buf_clone = buf.clone();
+        let mut sess = session.lock().await;
+        let send_with = sess.send_with.as_mut();
         let res = send_with(
             conn.lock().await.local_client_id.clone(),
             conn.lock().await.remote_client_id.clone(),
-            &buf,
+            &mut buf_clone,
             Duration::from_secs(0), //todo
         );
         if res.is_ok() {}
