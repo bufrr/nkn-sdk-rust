@@ -560,7 +560,7 @@ impl Session {
         bytes_received
     }
 
-    pub async fn write(&self, buf: &mut [u8]) -> usize {
+    pub async fn write(&self, buf: &[u8]) -> usize {
         if self.is_closed().await {
             println!("write: session is closed");
             return 0;
@@ -611,6 +611,148 @@ impl Session {
             conn.set_window_size(n, 1.0);
         }
     }
+
+    pub async fn receive_with(
+        &mut self,
+        local_client_id: String,
+        remote_client_id: String,
+        buf: &[u8],
+    ) {
+        let p = Packet::decode(buf).unwrap();
+        if p.close {
+            self.handle_close_packet().await;
+            return;
+        }
+
+        let is_established = self.is_established().await;
+        if !is_established && p.handshake {
+            //let mut sess = session.lock().await;
+            self.handle_handshake_packet(p.clone()).await;
+        }
+
+        if is_established && (!p.ack_start_seq.is_empty() || !p.ack_seq_count.is_empty()) {
+            if p.ack_start_seq.len() != p.ack_seq_count.len()
+                && !p.ack_start_seq.is_empty()
+                && !p.ack_seq_count.is_empty()
+            {
+                println!("receive_with: ack_start_seq and ack_seq_count length not equal");
+                return;
+            }
+
+            let mut count = 0;
+            if !p.ack_seq_count.is_empty() {
+                count = p.ack_start_seq.len();
+            } else {
+                count = p.ack_seq_count.len();
+            }
+
+            let mut ack_start_seq: u32 = 0;
+            let mut ack_end_seq: u32 = 0;
+
+            for i in 0..count {
+                if !p.ack_start_seq.is_empty() {
+                    ack_start_seq = p.ack_start_seq[i];
+                } else {
+                    ack_start_seq = MIN_SEQUENCE_ID;
+                }
+
+                if !p.ack_seq_count.is_empty() {
+                    ack_end_seq = next_seq(ack_start_seq, p.ack_seq_count[i] as i64);
+                } else {
+                    ack_end_seq = next_seq(ack_start_seq, 1);
+                }
+
+                let mut send_window_start_seq = self.send_window_start_seq.write().await;
+                let mut send_window_end_seq = self.send_window_end_seq.read().await;
+                if seq_in_between(
+                    *send_window_start_seq,
+                    *send_window_end_seq,
+                    next_seq(ack_end_seq, -1),
+                ) {
+                    if !seq_in_between(*send_window_start_seq, *send_window_end_seq, ack_start_seq)
+                    {
+                        ack_start_seq = *send_window_start_seq;
+                    }
+
+                    let mut seq = ack_start_seq;
+                    while seq_in_between(ack_start_seq, ack_end_seq, seq) {
+                        let mut connections = self.connections.write().await;
+                        for (key, conn) in connections.iter_mut() {
+                            let is_sent_by_me = key
+                                == &conn_key(
+                                    conn.local_client_id.clone(),
+                                    conn.remote_client_id.clone(),
+                                );
+                            conn.receive_ack(seq, is_sent_by_me).await;
+                        }
+                        self.send_window_data.write().await.remove(&seq);
+                        seq = next_seq(seq, 1);
+                    }
+                    if ack_start_seq == *send_window_start_seq {
+                        loop {
+                            *send_window_start_seq = next_seq(*send_window_start_seq, 1);
+                            if !self
+                                .send_window_data
+                                .read()
+                                .await
+                                .contains_key(send_window_start_seq.deref())
+                            {
+                                break;
+                            }
+                            if *send_window_start_seq == *send_window_end_seq {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            self.update_conn_window_size().await;
+        }
+        if is_established && p.bytes_read > *self.remote_bytes_read.read().await {
+            *self.remote_bytes_read.write().await = p.bytes_read;
+            self.send_window_update.0.send(()).unwrap();
+        }
+
+        if is_established && p.sequence_id > 0 {
+            if p.data.len() > self.recv_mtu as usize {
+                return println!("receive_with: data is too large");
+            }
+            if compare_seq(p.sequence_id, *self.recv_window_start_seq.read().await) >= 0
+                && self
+                    .recv_window_data
+                    .write()
+                    .await
+                    .contains_key(&p.sequence_id)
+            {
+                if *self.recv_window_used.read().await + p.data.len() as u32 > self.recv_window_size
+                {
+                    return println!("receive_with: recv_window is full");
+                }
+                self.recv_window_data
+                    .write()
+                    .await
+                    .insert(p.sequence_id, p.data.clone());
+                *self.recv_window_used.write().await += p.data.len() as u32;
+
+                if p.sequence_id == *self.recv_window_start_seq.read().await {
+                    select! {
+                       recv(self.recv_data_update.1) -> _ => {},
+                        default(Duration::from_millis(0)) => {},
+                    }
+                }
+            }
+            if let Some(conn) = self
+                .connections
+                .write()
+                .await
+                .get_mut(conn_key(local_client_id, remote_client_id).as_str())
+            {
+                conn.send_ack(p.sequence_id).await;
+            } else {
+                println!("receive_with: connection not found");
+            }
+        }
+    }
 }
 
 async fn start(session: Arc<Mutex<Session>>) {
@@ -649,146 +791,4 @@ async fn start(session: Arc<Mutex<Session>>) {
         tasks.push(Box::pin(h));
     }
     join_all(tasks).await;
-}
-
-pub async fn receive_with(
-    session: Arc<Mutex<Session>>,
-    local_client_id: String,
-    remote_client_id: String,
-    buf: &[u8],
-    timeout: Duration,
-) {
-    let mut sess = session.lock().await;
-    let p = Packet::decode(buf).unwrap();
-    if p.close {
-        sess.handle_close_packet().await;
-        return;
-    }
-
-    let is_established = session.lock().await.is_established().await;
-    if !is_established && p.handshake {
-        let mut sess = session.lock().await;
-        sess.handle_handshake_packet(p.clone()).await;
-    }
-
-    if is_established && (!p.ack_start_seq.is_empty() || !p.ack_seq_count.is_empty()) {
-        if p.ack_start_seq.len() != p.ack_seq_count.len()
-            && !p.ack_start_seq.is_empty()
-            && !p.ack_seq_count.is_empty()
-        {
-            println!("receive_with: ack_start_seq and ack_seq_count length not equal");
-            return;
-        }
-
-        let mut count = 0;
-        if !p.ack_seq_count.is_empty() {
-            count = p.ack_start_seq.len();
-        } else {
-            count = p.ack_seq_count.len();
-        }
-
-        let mut ack_start_seq: u32 = 0;
-        let mut ack_end_seq: u32 = 0;
-
-        for i in 0..count {
-            if !p.ack_start_seq.is_empty() {
-                ack_start_seq = p.ack_start_seq[i];
-            } else {
-                ack_start_seq = MIN_SEQUENCE_ID;
-            }
-
-            if !p.ack_seq_count.is_empty() {
-                ack_end_seq = next_seq(ack_start_seq, p.ack_seq_count[i] as i64);
-            } else {
-                ack_end_seq = next_seq(ack_start_seq, 1);
-            }
-
-            let mut send_window_start_seq = sess.send_window_start_seq.write().await;
-            let mut send_window_end_seq = sess.send_window_end_seq.read().await;
-            if seq_in_between(
-                *send_window_start_seq,
-                *send_window_end_seq,
-                next_seq(ack_end_seq, -1),
-            ) {
-                if !seq_in_between(*send_window_start_seq, *send_window_end_seq, ack_start_seq) {
-                    ack_start_seq = *send_window_start_seq;
-                }
-
-                let mut seq = ack_start_seq;
-                while seq_in_between(ack_start_seq, ack_end_seq, seq) {
-                    let mut connections = sess.connections.write().await;
-                    for (key, conn) in connections.iter_mut() {
-                        let is_sent_by_me = key
-                            == &conn_key(
-                                conn.local_client_id.clone(),
-                                conn.remote_client_id.clone(),
-                            );
-                        conn.receive_ack(seq, is_sent_by_me).await;
-                    }
-                    sess.send_window_data.write().await.remove(&seq);
-                    seq = next_seq(seq, 1);
-                }
-                if ack_start_seq == *send_window_start_seq {
-                    loop {
-                        *send_window_start_seq = next_seq(*send_window_start_seq, 1);
-                        if !sess
-                            .send_window_data
-                            .read()
-                            .await
-                            .contains_key(send_window_start_seq.deref())
-                        {
-                            break;
-                        }
-                        if *send_window_start_seq == *send_window_end_seq {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        sess.update_conn_window_size().await;
-    }
-    if is_established && p.bytes_read > *sess.remote_bytes_read.read().await {
-        *sess.remote_bytes_read.write().await = p.bytes_read;
-        sess.send_window_update.0.send(()).unwrap();
-    }
-
-    if is_established && p.sequence_id > 0 {
-        if p.data.len() > sess.recv_mtu as usize {
-            return println!("receive_with: data is too large");
-        }
-        if compare_seq(p.sequence_id, *sess.recv_window_start_seq.read().await) >= 0
-            && sess
-                .recv_window_data
-                .write()
-                .await
-                .contains_key(&p.sequence_id)
-        {
-            if *sess.recv_window_used.read().await + p.data.len() as u32 > sess.recv_window_size {
-                return println!("receive_with: recv_window is full");
-            }
-            sess.recv_window_data
-                .write()
-                .await
-                .insert(p.sequence_id, p.data.clone());
-            *sess.recv_window_used.write().await += p.data.len() as u32;
-
-            if p.sequence_id == *sess.recv_window_start_seq.read().await {
-                select! {
-                   recv(sess.recv_data_update.1) -> _ => {},
-                    default(Duration::from_millis(0)) => {},
-                }
-            }
-        }
-        if let Some(conn) = sess
-            .connections
-            .write()
-            .await
-            .get_mut(conn_key(local_client_id, remote_client_id).as_str())
-        {
-            conn.send_ack(p.sequence_id).await;
-        } else {
-            println!("receive_with: connection not found");
-        }
-    }
 }

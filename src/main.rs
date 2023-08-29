@@ -5,7 +5,33 @@ use std::time::Duration;
 use tokio::spawn;
 
 pub struct TestSession {
+    pub local_client_id: String,
+    pub remote_client_id: String,
     pub session: Session,
+}
+
+impl TestSession {
+    pub fn new(session: Session) -> Self {
+        TestSession {
+            local_client_id: "alice".to_string(),
+            remote_client_id: "bob".to_string(),
+            session,
+        }
+    }
+
+    pub async fn write(&mut self, buf: &[u8]) -> usize {
+        self.session.write(buf).await
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) {
+        self.session
+            .receive_with(
+                self.local_client_id.clone(),
+                self.remote_client_id.clone(),
+                buf,
+            )
+            .await
+    }
 }
 
 #[tokio::main]
@@ -31,7 +57,7 @@ async fn main() {
     };
     let ss: SendWith = Box::new(send1);
     let sess = Session::new(
-        ncp_config.clone(),
+        ncp_config,
         "".to_string(),
         "".to_string(),
         Vec::new(),
@@ -39,5 +65,7 @@ async fn main() {
         ss,
     );
 
-    let mut test_session = TestSession { session: sess };
+    let mut test_session = TestSession::new(sess);
+
+    test_session.write(b"hello").await;
 }
