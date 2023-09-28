@@ -117,9 +117,6 @@ pub struct Client {
     challenge_signature_channel: Channel<StSaltAndSignature>,
 }
 
-// unsafe impl Sync for Client {}
-// unsafe impl Send for Client {}
-
 impl Client {
     pub fn new(
         account: Account,

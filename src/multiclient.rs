@@ -5,7 +5,7 @@ use crate::pb;
 use crate::pb::payloads::{Payload, PayloadType};
 use crate::rpc::{Node, RPCConfig};
 use crate::utils::{
-    add_identifier, add_multiclient_prefix, make_address_string, remote_identifier, Channel,
+    add_identifier, add_multiclient_prefix, make_address_string, remove_identifier, Channel,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use futures::executor::block_on;
@@ -52,7 +52,7 @@ impl MultiClient {
             num_clients += 1;
             offset = 1;
         }
-        let public_key = account.public_key().clone();
+        let public_key = *account.public_key();
         let addr = make_address_string(&public_key, &base_identifier);
 
         let (connect_tx, connect_rx) = bounded(1);
@@ -152,7 +152,7 @@ impl MultiClient {
                             continue;
                         }
                         cache.blocking().insert(cache_key, ());
-                        (msg.src, _) = remote_identifier(msg.src.clone());
+                        (msg.src, _) = remove_identifier(msg.src.clone());
                         if msg.no_reply {
                             todo!()
                         } else {
@@ -161,8 +161,7 @@ impl MultiClient {
                         if *close_clone.lock().unwrap() {
                             return;
                         }
-                        let msg_clone = msg.clone();
-                        message_tx_clone.send(msg_clone).unwrap();
+                        message_tx_clone.send(msg.clone()).unwrap();
                     }
                 }
             });
@@ -198,26 +197,25 @@ impl MultiClient {
         let clients_clone = self.clients.clone();
         //let cc = clients_clone.lock().unwrap().get(&1).unwrap();
 
-        tokio::spawn(async move {
-            let mut sent = 0;
-            //let c = clients_clone.lock().unwrap();
-            let len = clients_clone.lock().unwrap().len();
-            for (i, client) in clients_clone.lock().unwrap().iter() {
-                let fu = send_with_client(
-                    client,
-                    *i,
-                    &dests,
-                    payload.clone(),
-                    !config_clone.unencrypted,
-                    config_clone.max_holding_secs,
-                );
-                block_on(fu).expect("block on error");
-                sent += 1;
-            }
-            if sent == 0 {
-                //todo!()
-            }
-        });
+        let mut sent = 0;
+        //let c = clients_clone.lock().unwrap();
+        let len = clients_clone.lock().unwrap().len();
+        println!("111");
+        for (i, client) in clients_clone.lock().unwrap().iter() {
+            let fu = send_with_client(
+                client,
+                *i,
+                &dests,
+                payload.clone(),
+                !config_clone.unencrypted,
+                config_clone.max_holding_secs,
+            );
+            block_on(fu).expect("block on error");
+            sent += 1;
+        }
+        if sent == 0 {
+            //todo!()
+        }
     }
 
     pub fn get_clients(&self) -> HashMap<i32, Client> {

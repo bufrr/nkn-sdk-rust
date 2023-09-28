@@ -1,3 +1,6 @@
+use std::error::Error;
+use std::io;
+
 #[derive(Debug, PartialEq)]
 pub enum NKNError {
     Success = 0,
@@ -100,3 +103,43 @@ impl From<i64> for NKNError {
 
 #[derive(Debug, Clone)]
 struct DoubleError;
+
+#[derive(Debug)]
+pub enum NcpError {
+    Io(io::Error),
+    SessionNotEstablished,
+    SessionClosed,
+    BufferEmpty,
+    BufferTooLarge,
+    SessionAlreadyAccepted,
+    UndefinedConnection,
+}
+
+impl From<io::Error> for NcpError {
+    fn from(err: io::Error) -> NcpError {
+        NcpError::Io(err)
+    }
+}
+
+impl std::fmt::Display for NcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            NcpError::Io(ref err) => err.fmt(f),
+            _ => f.write_str(self.description()),
+        }
+    }
+}
+
+impl Error for NcpError {
+    fn description(&self) -> &str {
+        match *self {
+            NcpError::Io(ref err) => err.description(),
+            NcpError::SessionNotEstablished => "Session is not established",
+            NcpError::SessionClosed => "Session is closed",
+            NcpError::BufferEmpty => "Buffer is empty",
+            NcpError::BufferTooLarge => "Buffer is too large",
+            NcpError::SessionAlreadyAccepted => "Session is already accepted",
+            NcpError::UndefinedConnection => "The connection is not defined",
+        }
+    }
+}

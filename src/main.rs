@@ -1,3 +1,4 @@
+use nkn_sdk_rust::error::NcpError;
 use nkn_sdk_rust::session::{NcpConfig, SendWith, Session};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +20,7 @@ impl TestSession {
         }
     }
 
-    pub async fn write(&mut self, buf: &[u8]) -> usize {
+    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, NcpError> {
         self.session.write(buf).await
     }
 
@@ -67,5 +68,8 @@ async fn main() {
 
     let mut test_session = TestSession::new(sess);
 
-    test_session.write(b"hello").await;
+    test_session
+        .write(b"hello")
+        .await
+        .expect("TODO: panic message");
 }

@@ -124,7 +124,7 @@ pub fn add_multiclient_prefix(dest: &Vec<String>, client_id: i32) -> Vec<String>
     result
 }
 
-pub fn remote_identifier(src: String) -> (String, String) {
+pub fn remove_identifier(src: String) -> (String, String) {
     let s = src.split('.').collect::<Vec<&str>>();
     let RE: Regex = Regex::new(r"^__\\d+__$").unwrap();
 
@@ -209,3 +209,78 @@ impl Ord for SeqElem {
         }
     }
 }
+
+//
+// use std::cmp::Ordering;
+// use std::collections::BinaryHeap;
+// use std::time::Duration;
+// use std::error::Error;
+// use std::fmt;
+//
+// const MAX_WAIT: Duration = Duration::from_secs(1);
+// const MIN_SEQUENCE_ID: u32 = 0;
+//
+// #[derive(Debug)]
+// struct MaxWaitError;
+//
+// impl fmt::Display for MaxWaitError {
+//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//         write!(f, "max wait time reached")
+//     }
+// }
+//
+// impl Error for MaxWaitError {}
+//
+// #[derive(Eq, PartialEq)]
+// struct SeqHeap(u32);
+//
+// impl Ord for SeqHeap {
+//     fn cmp(&self, other: &Self) -> Ordering {
+//         compare_seq(self.0, other.0).cmp(&Ordering::Equal)
+//     }
+// }
+//
+// impl PartialOrd for SeqHeap {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         Some(self.cmp(other))
+//     }
+// }
+//
+// fn next_seq(seq: u32, step: i64) -> u32 {
+//     let max = u32::MAX - MIN_SEQUENCE_ID as i64 + 1;
+//     let mut res = ((seq as i64) - MIN_SEQUENCE_ID as i64 + step) % max;
+//     if res < 0 {
+//         res += max;
+//     }
+//     (res + MIN_SEQUENCE_ID as i64) as u32
+// }
+//
+// fn seq_in_between(start_seq: u32, end_seq: u32, target_seq: u32) -> bool {
+//     if start_seq <= end_seq {
+//         target_seq >= start_seq && target_seq < end_seq
+//     } else {
+//         target_seq >= start_seq || target_seq < end_seq
+//     }
+// }
+//
+// fn compare_seq(seq1: u32, seq2: u32) -> i32 {
+//     if seq1 == seq2 {
+//         0
+//     } else if seq1 < seq2 {
+//         if seq2 - seq1 < u32::MAX / 2 {
+//             -1
+//         } else {
+//             1
+//         }
+//     } else {
+//         if seq1 - seq2 < u32::MAX / 2 {
+//             1
+//         } else {
+//             -1
+//         }
+//     }
+// }
+//
+// fn conn_key(local_client_id: &str, remote_client_id: &str) -> String {
+//     format!("{} - {}", local_client_id, remote_client_id)
+// }

@@ -92,7 +92,7 @@ impl WalletData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Wallet {
     config: WalletConfig,
     account: Account,

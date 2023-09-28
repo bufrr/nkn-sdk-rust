@@ -5,7 +5,7 @@ pub mod client;
 mod connection;
 pub mod constants;
 pub mod crypto;
-mod error;
+pub mod error;
 pub mod message;
 pub mod multiclient;
 mod nanopay;

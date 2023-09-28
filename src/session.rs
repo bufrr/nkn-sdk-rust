@@ -1,4 +1,5 @@
 use crate::connection::{start_conn, Connection};
+use crate::error::NcpError;
 use crate::pb::packet::Packet;
 use crate::utils::{compare_seq, conn_key, next_seq, seq_in_between, Channel};
 use crossbeam_channel::{bounded, select, tick};
@@ -6,16 +7,17 @@ use futures_util::future::{join_all, select_ok};
 use prost::Message;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::Error;
+use std::io::{Error, Write};
 use std::ops::{Deref, Sub};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
-pub type SendWith = Box<dyn FnMut(String, String, &[u8], Duration) -> Result<usize, Error>>;
+pub type SendWith =
+    Box<dyn FnMut(String, String, &[u8], Duration) -> Result<usize, Error> + Send + Sync + 'static>;
 
 pub const MIN_SEQUENCE_ID: u32 = 1;
 
@@ -38,7 +40,7 @@ pub struct NcpConfig {
 impl Default for NcpConfig {
     fn default() -> Self {
         Self {
-            non_stream: false,
+            non_stream: true,
             session_window_size: 4 << 20,
             mtu: 1024,
             min_connection_window_size: 1,
@@ -72,7 +74,7 @@ pub struct Session {
     is_established: Arc<RwLock<bool>>,
     is_closed: Arc<RwLock<bool>>,
 
-    send_buffer: Arc<RwLock<Vec<u8>>>,
+    pub send_buffer: Arc<RwLock<[u8; 1024]>>,
     pub send_window_start_seq: Arc<RwLock<u32>>,
     pub send_window_end_seq: Arc<RwLock<u32>>,
     pub send_window_data: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
@@ -115,14 +117,14 @@ impl Session {
             remote_addr,
             local_client_ids,
             remote_client_ids,
-            send_window_size: 0,
-            recv_window_size: 0,
+            send_window_size: 4 << 20,
+            recv_window_size: 4 << 20,
             send_mtu: buffer_size,
             recv_mtu: buffer_size,
             is_accepted: Arc::new(RwLock::new(false)),
             is_established: Arc::new(RwLock::new(false)),
             is_closed: Arc::new(RwLock::new(false)),
-            send_buffer: Arc::new(RwLock::new(Vec::new())),
+            send_buffer: Arc::new(RwLock::new([0; 1024])),
             send_window_start_seq: Arc::new(RwLock::new(MIN_SEQUENCE_ID)),
             send_window_end_seq: Arc::new(RwLock::new(MIN_SEQUENCE_ID)),
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -191,87 +193,46 @@ impl Session {
     }
 
     pub fn get_resend_seq(&self) -> Result<u32, String> {
-        let mut seq: u32 = 0;
-        let (_, rx) = self.resend_chan.clone();
-        select! {
-            recv(rx) -> v => {
-                match v {
-                    Ok(v) => {
-                        seq = v;
-                        Ok(seq)
-                    },
-                    Err(e) => {
-                        Err(format!("get_resend_seq error: {}", e))
-                    }
-                }
-            },
-            default(Duration::from_millis(0)) => {
-                Ok(0)
-            }
-        }
+        get_seq(self.resend_chan.clone())
     }
 
     pub fn get_send_seq(&self) -> Result<u32, String> {
-        let mut seq: u32 = 0;
-        let (_, rx) = self.send_chan.clone();
-        let (_, rx_resend) = self.resend_chan.clone();
-        select! {
-            recv(rx) -> v => {
-                match v {
-                    Ok(v) => {
-                        seq = v;
-                        Ok(seq)
-                    },
-                    Err(e) => {
-                        Err(format!("get_send_seq error: {}", e))
-                    }
-                }
-            },
-            recv(rx_resend) -> v => {
-                match v {
-                    Ok(v) => {
-                        seq = v;
-                        Ok(seq)
-                    },
-                    Err(e) => {
-                        Err(format!("get_resend_seq error: {}", e))
-                    }
-                }
-            },
-            default(Duration::from_millis(0)) => {
-                Ok(0)
-            }
-        }
+        get_seq(self.send_chan.clone())
     }
 
     pub async fn flush_send_buffer(&self) {
+        println!("flush_send_buffer");
         let mut send_buffer = self.send_buffer.write().await;
         if send_buffer.len() == 0 {
             return;
         }
-
-        let seq = self.send_window_end_seq.read().await;
-        let p = Packet {
-            sequence_id: *seq,
-            data: send_buffer.clone(),
-            ..Default::default()
-        };
         let mut buf = Vec::new();
-        p.encode(&mut buf).unwrap();
+        let mut seq: u32 = 0;
+        {
+            let end_seq = self.send_window_end_seq.read().await;
+            seq = *end_seq;
+            let p = Packet {
+                sequence_id: seq,
+                data: send_buffer.to_vec(),
+                ..Default::default()
+            };
+            p.encode(&mut buf).unwrap();
+        }
 
         let mut send_window_data = self.send_window_data.write().await;
         let mut send_window_end_seq = self.send_window_end_seq.write().await;
-        send_window_data.insert(*seq, buf);
-        *send_window_end_seq = next_seq(*seq, 1);
-        send_buffer.clear();
+        send_window_data.insert(seq, buf);
+        *send_window_end_seq = next_seq(seq, 1);
+        *send_buffer = [0u8; 1024];
 
         let (tx, _) = self.send_chan.clone();
-        tx.send(*seq).unwrap();
+        tx.send(seq).unwrap();
     }
 
     pub async fn start_flush(&self) {
+        println!("start_flush");
         loop {
-            sleep(Duration::from_millis(self.config.flush_interval as u64));
+            sleep(Duration::from_millis(self.config.flush_interval as u64)).await;
             {
                 let buffer = self.send_buffer.read().await;
                 let should_flush = buffer.len() > 0;
@@ -284,43 +245,48 @@ impl Session {
     }
 
     pub async fn start_check_bytes_read(&mut self) {
+        println!("start_check_bytes_read");
         loop {
-            sleep(Duration::from_millis(self.config.check_timeout_interval));
-            let sent_time = self.bytes_read_sent_time.read().await;
-            let update_time = self.bytes_read_update_time.read().await;
-            let bytes_read = self.bytes_read.read().await;
+            sleep(Duration::from_millis(self.config.check_timeout_interval)).await;
+            {
+                let sent_time = self.bytes_read_sent_time.read().await;
+                let update_time = self.bytes_read_update_time.read().await;
+                let bytes_read = self.bytes_read.read().await;
 
-            let wait = SystemTime::now()
-                .sub(Duration::from_millis(
-                    self.config.send_bytes_read_threshold as u64,
-                ))
-                .duration_since(*update_time)
-                .is_err();
-            if *bytes_read == 0 || sent_time.duration_since(*update_time).is_ok() || wait {
-                continue;
-            }
+                let wait = SystemTime::now()
+                    .sub(Duration::from_millis(
+                        self.config.send_bytes_read_threshold as u64,
+                    ))
+                    .duration_since(*update_time)
+                    .is_err();
+                if *bytes_read == 0 || sent_time.duration_since(*update_time).is_ok() || wait {
+                    continue;
+                }
 
-            let p = Packet {
-                bytes_read: *bytes_read,
-                ..Default::default()
-            };
-            let mut buf = Vec::new();
-            p.encode(&mut buf).unwrap();
+                let p = Packet {
+                    bytes_read: *bytes_read,
+                    ..Default::default()
+                };
+                let mut buf = Vec::new();
+                p.encode(&mut buf).unwrap();
 
-            let mut success = false;
-            let connections = self.connections.read().await;
-            let send_with = self.send_with.as_mut();
-            for (_, conn) in connections.iter() {
-                let res = (send_with)(
-                    conn.local_client_id.clone(),
-                    conn.remote_client_id.clone(),
-                    &mut buf,
-                    Duration::from_millis(conn.retransmission_timeout().await.as_millis() as u64),
-                );
-                success = true;
-            }
-            if success {
-                self.update_bytes_read_sent_time().await;
+                let mut success = false;
+                let connections = self.connections.read().await;
+                let send_with = self.send_with.as_mut();
+                for (_, conn) in connections.iter() {
+                    let res = (send_with)(
+                        conn.local_client_id.clone(),
+                        conn.remote_client_id.clone(),
+                        &mut buf,
+                        Duration::from_millis(
+                            conn.retransmission_timeout().await.as_millis() as u64
+                        ),
+                    );
+                    success = true;
+                }
+                if success {
+                    self.update_bytes_read_sent_time().await;
+                }
             }
         }
     }
@@ -560,25 +526,21 @@ impl Session {
         bytes_received
     }
 
-    pub async fn write(&self, buf: &[u8]) -> usize {
-        if self.is_closed().await {
-            println!("write: session is closed");
-            return 0;
-        }
-        if self.is_established().await {
-            println!("write: session is not established");
-            return 0;
+    pub async fn write(&self, buf: &[u8]) -> Result<usize, NcpError> {
+        if !self.is_established().await {
+            return Err(NcpError::SessionNotEstablished);
         }
 
-        if !self.is_stream() && buf.len() > self.send_mtu as usize
-            || buf.len() > self.send_window_size as usize
-        {
-            println!("write: buf is too large");
-            return 0;
+        if self.is_closed().await {
+            return Err(NcpError::SessionClosed);
         }
 
         if buf.is_empty() {
-            return 0;
+            return Err(NcpError::BufferEmpty);
+        } else if !self.is_stream() && buf.len() > self.send_mtu as usize
+            || buf.len() > self.send_window_size as usize
+        {
+            return Err(NcpError::BufferTooLarge);
         }
 
         let mut bytes_send: usize = 0;
@@ -586,15 +548,17 @@ impl Session {
         if self.is_stream() {
             //todo
         } else {
-            self.wait_for_send_window(buf.len() as u32).await;
-            let mut send_buffer = self.send_buffer.write().await;
-            *send_buffer = send_buffer[..buf.len()].to_owned();
-            *self.bytes_write.write().await += buf.len() as u64;
-            bytes_send += buf.len();
+            {
+                self.wait_for_send_window(buf.len() as u32).await;
+                let mut send_buffer = self.send_buffer.write().await;
+                send_buffer[..buf.len()].copy_from_slice(buf);
+                *self.bytes_write.write().await += buf.len() as u64;
+                bytes_send += buf.len();
+            }
 
             self.flush_send_buffer().await;
         }
-        bytes_send
+        Ok(bytes_send)
     }
 
     pub async fn update_conn_window_size(&self) {
@@ -618,6 +582,10 @@ impl Session {
         remote_client_id: String,
         buf: &[u8],
     ) {
+        println!("receive_with");
+        if buf.len() > 10 {
+            return;
+        }
         let p = Packet::decode(buf).unwrap();
         if p.close {
             self.handle_close_packet().await;
@@ -663,7 +631,7 @@ impl Session {
                 }
 
                 let mut send_window_start_seq = self.send_window_start_seq.write().await;
-                let mut send_window_end_seq = self.send_window_end_seq.read().await;
+                let send_window_end_seq = self.send_window_end_seq.read().await;
                 if seq_in_between(
                     *send_window_start_seq,
                     *send_window_end_seq,
@@ -755,10 +723,11 @@ impl Session {
     }
 }
 
-async fn start(session: Arc<Mutex<Session>>) {
+pub async fn start_session(session: Arc<Mutex<Session>>) {
     let session_clone = session.clone();
     let session_clone2 = session.clone();
-    let mut tasks: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![];
+    let session_clone3 = session.clone();
+    let mut tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = vec![];
 
     let flush = async move {
         let sess = session_clone.lock().await;
@@ -766,29 +735,118 @@ async fn start(session: Arc<Mutex<Session>>) {
     };
 
     let check = async move {
-        let mut sess = session_clone2.lock().await;
-        sess.start_check_bytes_read().await;
+        start_check_bytes_read(session_clone2).await;
     };
     tasks.push(Box::pin(flush));
     tasks.push(Box::pin(check));
 
-    let sess = session.lock().await;
+    {
+        let sess = session_clone3.lock().await;
 
-    //let mut conn_tasks = vec![];
-    for conn in sess.connections.read().await.values() {
-        let conn = Arc::new(Mutex::new(conn.clone()));
-        let config_clone = sess.config.clone();
-        let sess_clone = session.clone();
-        let h = start_conn(
-            conn.clone(),
-            sess_clone,
-            config_clone,
-            sess.send_window_data.clone(),
-            sess.send_chan.1.clone(),
-            sess.resend_chan.1.clone(),
-            sess.resend_chan.0.clone(),
-        );
-        tasks.push(Box::pin(h));
+        println!("999");
+        //let mut conn_tasks = vec![];
+        for conn in sess.connections.read().await.values() {
+            let conn = Arc::new(Mutex::new(conn.clone()));
+            let config_clone = sess.config.clone();
+            let sess_clone = session.clone();
+            let h = start_conn(
+                conn.clone(),
+                sess_clone,
+                config_clone,
+                sess.send_window_data.clone(),
+                sess.send_chan.1.clone(),
+                sess.resend_chan.1.clone(),
+                sess.resend_chan.0.clone(),
+            );
+            tasks.push(Box::pin(h));
+        }
     }
     join_all(tasks).await;
+}
+
+pub async fn start_flush(session: Arc<Mutex<Session>>, send_buffer: Arc<RwLock<[u8; 1024]>>) {
+    println!("start_flush");
+    loop {
+        sleep(Duration::from_millis(100)).await;
+        {
+            let sess = session.lock().await;
+            let buffer = send_buffer.read().await;
+            let should_flush = buffer.len() > 0;
+            if !should_flush {
+                continue;
+            }
+            sess.flush_send_buffer().await;
+        }
+    }
+}
+
+pub async fn start_check_bytes_read(session: Arc<Mutex<Session>>) {
+    println!("start_check_bytes_read");
+    loop {
+        sleep(Duration::from_millis(100)).await;
+        {
+            let mut buf = Vec::new();
+            let mut success = false;
+
+            {
+                let sess = session.lock().await;
+                let sent_time = sess.bytes_read_sent_time.read().await;
+                let update_time = sess.bytes_read_update_time.read().await;
+                let bytes_read = sess.bytes_read.read().await;
+
+                let wait = SystemTime::now()
+                    .sub(Duration::from_millis(
+                        sess.config.send_bytes_read_threshold as u64,
+                    ))
+                    .duration_since(*update_time)
+                    .is_err();
+                if *bytes_read == 0 || sent_time.duration_since(*update_time).is_ok() || wait {
+                    continue;
+                }
+
+                let p = Packet {
+                    bytes_read: *bytes_read,
+                    ..Default::default()
+                };
+                p.encode(&mut buf).unwrap();
+            }
+            {
+                let mut sess = session.lock().await;
+                let send_with = sess.send_with.as_mut();
+                let connections = sess.connections.read().await;
+                for (_, conn) in connections.iter() {
+                    let res = (send_with)(
+                        conn.local_client_id.clone(),
+                        conn.remote_client_id.clone(),
+                        &mut buf,
+                        Duration::from_millis(
+                            conn.retransmission_timeout().await.as_millis() as u64
+                        ),
+                    );
+                    success = true;
+                }
+                // if success {
+                //     sess.update_bytes_read_sent_time().await;
+                // }
+            }
+        }
+    }
+}
+
+fn get_seq(chan: Channel<u32>) -> Result<u32, String> {
+    let mut seq: u32 = 0;
+    let (_, rx) = chan;
+    select! {
+        recv(rx) -> v => {
+            match v {
+                Ok(v) => {
+                    seq = v;
+                    Ok(seq)
+                },
+                Err(e) => {
+                    Err(format!("get_seq error: {}", e))
+                }
+            }
+        },
+    }
 }

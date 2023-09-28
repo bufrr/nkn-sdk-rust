@@ -4,13 +4,14 @@ use std::collections::{BinaryHeap, HashMap};
 
 use crate::pb::packet::Packet;
 use crate::utils::{next_seq, SeqElem, SeqHeap};
+use futures_util::future::select_all;
 use futures_util::join;
 use prost::Message;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -30,9 +31,9 @@ impl Connection {
     pub fn new(local_client_id: String, remote_client_id: String, window_size: f64) -> Self {
         let (send_window_update_tx, send_window_update_rx) = crossbeam_channel::bounded(1);
         Self {
-            config: Default::default(),
             local_client_id,
             remote_client_id,
+            config: Default::default(),
             window_size,
             send_window_update_tx,
             send_window_update_rx,
@@ -76,29 +77,34 @@ impl Connection {
     }
 
     pub async fn receive_ack(&mut self, sequence_id: u32, is_sent_by_me: bool) {
-        let time_sent_seq = self.time_sent_seq.read().await;
-        let t = time_sent_seq.get(&sequence_id).unwrap();
+        {
+            let time_sent_seq = self.time_sent_seq.read().await;
+            let t = match time_sent_seq.get(&sequence_id) {
+                Some(time) => time,
+                None => return,
+            };
 
-        let resent_seq = self.resent_seq.read().await;
-        match resent_seq.get(&sequence_id) {
-            Some(_) => {}
-            None => {
-                let size = self.window_size + 1.0;
-                //set_window_size(&mut conn.window_size, size);
-            }
-        };
+            let resent_seq = self.resent_seq.read().await;
+            match resent_seq.get(&sequence_id) {
+                Some(_) => {}
+                None => {
+                    let size = self.window_size + 1.0;
+                    //set_window_size(&mut conn.window_size, size);
+                }
+            };
 
-        if is_sent_by_me {
-            let rtt = SystemTime::now().duration_since(*t).unwrap();
-            let timeout = self.retransmission_timeout().await;
-            let d = (3 * rtt - timeout).as_nanos() as f64
-                / (Duration::from_millis(1000)).as_nanos() as f64
-                * Duration::from_millis(100).as_nanos() as f64;
-            let ms = Duration::from_nanos(d.tanh() as u64);
-            *self.retransmission_timeout.write().await = ms;
-            if ms.as_millis() > self.config.max_retransmission_timeout as u128 {
-                *self.retransmission_timeout.write().await =
-                    Duration::from_millis(self.config.max_retransmission_timeout);
+            if is_sent_by_me {
+                let rtt = SystemTime::now().duration_since(*t).unwrap();
+                let timeout = self.retransmission_timeout().await;
+                let d = (3 * rtt - timeout).as_nanos() as f64
+                    / (Duration::from_millis(1000)).as_nanos() as f64
+                    * Duration::from_millis(100).as_nanos() as f64;
+                let ms = Duration::from_nanos(d.tanh() as u64);
+                *self.retransmission_timeout.write().await = ms;
+                if ms.as_millis() > self.config.max_retransmission_timeout as u128 {
+                    *self.retransmission_timeout.write().await =
+                        Duration::from_millis(self.config.max_retransmission_timeout);
+                }
             }
         }
 
@@ -127,6 +133,7 @@ pub async fn start_conn(
     resend_rx: Receiver<u32>,
     resend_tx: Sender<u32>,
 ) {
+    println!("start_conn");
     join!(
         tx(
             conn.clone(),
@@ -147,6 +154,7 @@ async fn tx(
     send_rx: Receiver<u32>,
     resend_rx: Receiver<u32>,
 ) {
+    println!("tx");
     let mut conn = conn.lock().await;
     let mut seq = 0;
     loop {
@@ -181,21 +189,17 @@ async fn tx(
         {
             let mut session = session.lock().await;
             let send_with = session.send_with.as_mut();
-            let res = send_with(
+            if let Err(err) = send_with(
                 conn.local_client_id.clone(),
                 conn.local_client_id.clone(),
                 &mut buf_clone,
                 Duration::from_secs(0),
-            );
-            match res {
-                Ok(_) => {}
-                Err(err) => {
-                    println!("send_with error: {:?}", err);
-                    let window_size = conn.window_size;
-                    conn.set_window_size(window_size / 2.0, 1.0);
-                    //session.update_conn_window_size TODO
-                    seq = 0;
-                }
+            ) {
+                println!("send_with error: {:?}", err);
+                let window_size = conn.window_size;
+                conn.set_window_size(window_size / 2.0, 1.0);
+                //session.update_conn_window_size TODO
+                seq = 0;
             }
         }
 
@@ -217,8 +221,9 @@ async fn tx(
 }
 
 async fn send_ack(conn: Arc<Mutex<Connection>>, session: Arc<Mutex<Session>>, config: NcpConfig) {
+    println!("send_ack");
     loop {
-        sleep(Duration::from_secs(config.send_ack_interval));
+        sleep(Duration::from_secs(config.send_ack_interval)).await;
         {
             let c = conn.lock().await;
             if c.send_ack_queue_len().await == 0 {
@@ -297,7 +302,7 @@ async fn check_timeout(
     drop(sess);
     let mut new_resend = false;
     loop {
-        sleep(Duration::from_secs(config.check_timeout_interval));
+        sleep(Duration::from_secs(config.check_timeout_interval)).await;
 
         let conn = conn.lock().await;
         let threshold = SystemTime::now() - conn.retransmission_timeout().await;
